@@ -36,7 +36,7 @@ jobs:
         run: go run scripts/gen_resources.go
 
       - name: Build cross-platform release binaries
-        run: make build-all
+        run: make build-binaries
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
@@ -89,13 +89,17 @@ jobs:
           mkdir -p ../dist
           APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
           cp "$APK_PATH" ../dist/directcrate-android.apk
-          unzip -l ../dist/directcrate-android.apk | grep "libdirectcrate.so"
+          cd ../dist
+          sha256sum directcrate-android.apk > directcrate-android.apk.sha256
+          unzip -l directcrate-android.apk | grep "libdirectcrate.so"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: dist/directcrate-android.apk
+          path: |
+            dist/directcrate-android.apk
+            dist/directcrate-android.apk.sha256
 
   publish:
     name: Publish GitHub Release
@@ -114,7 +118,15 @@ jobs:
         run: |
           mkdir -p dist
           find artifacts/ -type f -exec cp {} dist/ \;
-          ls -la dist/
+          cd dist
+          for f in *; do
+            if [[ "$f" != *.sha256 ]]; then
+              if [ ! -f "${f}.sha256" ]; then
+                sha256sum "$f" > "${f}.sha256"
+              fi
+            fi
+          done
+          ls -la
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

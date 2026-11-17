@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	appVersion       = "v1.0.0"
+	appVersion       = "v1.0.1"
 	defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	defaultBufferMB  = 4
 	maxRetries       = 10
@@ -246,6 +246,57 @@ func sampleProcessMemMB() float64 {
 	return float64(m.Sys) / (1024 * 1024)
 }
 
+var (
+	winTempMu        sync.Mutex
+	lastWinTempCheck time.Time
+	cachedWinTemp    float64
+	cachedWinStatus  string
+)
+
+func sampleWindowsTemperature() (float64, string) {
+	winTempMu.Lock()
+	defer winTempMu.Unlock()
+
+	now := time.Now()
+	if !lastWinTempCheck.IsZero() && now.Sub(lastWinTempCheck) < 5*time.Second {
+		return cachedWinTemp, cachedWinStatus
+	}
+	lastWinTempCheck = now
+
+	// Attempt WMI MSAcpi_ThermalZoneTemperature query when permitted
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty CurrentTemperature")
+	out, err := cmd.Output()
+	if err != nil {
+		cachedWinTemp = 0.0
+		cachedWinStatus = ""
+		return 0.0, ""
+	}
+
+	strVal := strings.TrimSpace(string(out))
+	if rawK10, err := strconv.ParseFloat(strVal, 64); err == nil && rawK10 > 2732.0 && rawK10 < 3932.0 {
+		celsius := (rawK10 / 10.0) - 273.15
+		if celsius >= 15.0 && celsius <= 115.0 {
+			cachedWinTemp = celsius
+			status := "normal"
+			if celsius >= 92.0 {
+				status = "hot"
+			} else if celsius >= 75.0 {
+				status = "warm"
+			}
+			cachedWinStatus = status
+			return cachedWinTemp, cachedWinStatus
+		}
+	}
+
+	cachedWinTemp = 0.0
+	cachedWinStatus = ""
+	return 0.0, ""
+}
+
 func sampleDeviceTemperature() (float64, string) {
 	if runtime.GOOS == "linux" {
 		matches, err := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
@@ -275,6 +326,8 @@ func sampleDeviceTemperature() (float64, string) {
 				return maxTemp, status
 			}
 		}
+	} else if runtime.GOOS == "windows" {
+		return sampleWindowsTemperature()
 	}
 	return 0.0, ""
 }
@@ -298,7 +351,7 @@ func startTelemetrySampler() {
 				if clientCount > 0 || curStatus == "running" {
 					manager.Update(func(s *ExtractionState) {
 						s.MemMB = mem
-						if runtime.GOOS == "linux" && temp > 0 {
+						if temp > 0 {
 							s.TempC = temp
 							s.ThermalStatus = status
 						}
@@ -812,11 +865,7 @@ func saveSettings(cfg AppSettings) error {
 	}
 	currentSettings = cfg
 
-	if cfg.SpeedLimitMBs > 0 {
-		globalSpeedLimitBytesPerSec.Store(int64(cfg.SpeedLimitMBs) * 1024 * 1024)
-	} else {
-		globalSpeedLimitBytesPerSec.Store(0)
-	}
+	setGlobalSpeedLimit(cfg.SpeedLimitMBs)
 
 	manager.Update(func(s *ExtractionState) {
 		s.SpeedLimitMBs = cfg.SpeedLimitMBs
@@ -999,9 +1048,7 @@ func executeTask(opts TaskOptions) {
 	if opts.SpeedLimitMBs < 0 {
 		opts.SpeedLimitMBs = 0
 	}
-	if opts.SpeedLimitMBs > 0 {
-		globalSpeedLimitBytesPerSec.Store(int64(opts.SpeedLimitMBs) * 1024 * 1024)
-	}
+	setGlobalSpeedLimit(opts.SpeedLimitMBs)
 
 	urls := parseURLList(opts.URL)
 	if len(urls) == 0 {
@@ -1200,6 +1247,10 @@ func executeTask(opts TaskOptions) {
 	var lastTelemetryTime = startTime
 	var peakSpeed float64
 	var currentTotalRead int64
+	var smoothedSpeedMBs float64
+	var lastETATime time.Time
+	var lastComputedETA = "--:--"
+	var streamingPhaseStarted bool
 
 	telemetryCallback := func(n int64) {
 		manager.mu.Lock()
@@ -1212,6 +1263,20 @@ func executeTask(opts TaskOptions) {
 		now := time.Now()
 		currentTotalRead += n
 		rollingSpeedMBs := speedCalc.addSample(now, currentTotalRead)
+		if smoothedSpeedMBs <= 0 {
+			smoothedSpeedMBs = rollingSpeedMBs
+		} else {
+			smoothedSpeedMBs = 0.2*rollingSpeedMBs + 0.8*smoothedSpeedMBs
+		}
+
+		if !streamingPhaseStarted && currentTotalRead > 0 {
+			streamingPhaseStarted = true
+			manager.Update(func(s *ExtractionState) {
+				if s.Status == "running" && strings.HasPrefix(s.Message, "Validating storage") {
+					s.Message = "Streaming & unpacking..."
+				}
+			})
+		}
 
 		elapsedSinceLast := now.Sub(lastTelemetryTime).Seconds()
 		if elapsedSinceLast >= 0.20 { // 200ms throttle (at most 5 updates/second)
@@ -1220,15 +1285,18 @@ func executeTask(opts TaskOptions) {
 			}
 
 			var pct float64
-			var etaStr = "--:--"
 			if contentLength > 0 {
 				pct = (float64(currentTotalRead) / float64(contentLength)) * 100
 				remBytes := contentLength - currentTotalRead
-				speedBytesSec := rollingSpeedMBs * 1024 * 1024
+				speedBytesSec := smoothedSpeedMBs * 1024 * 1024
 				if speedBytesSec > 0 && remBytes > 0 {
 					etaSec := int(float64(remBytes) / speedBytesSec)
-					etaStr = fmt.Sprintf("%02d:%02d", etaSec/60, etaSec%60)
+					lastComputedETA = fmt.Sprintf("%02d:%02d", etaSec/60, etaSec%60)
 				}
+			}
+
+			if lastETATime.IsZero() || now.Sub(lastETATime) >= 1*time.Second {
+				lastETATime = now
 			}
 
 			memMB := sampleProcessMemMB()
@@ -1256,13 +1324,16 @@ func executeTask(opts TaskOptions) {
 				s.Percent = pct
 				s.SpeedMBs = rollingSpeedMBs
 				s.PeakSpeedMBs = peakSpeed
-				s.ETA = etaStr
+				s.ETA = lastComputedETA
 				s.MemMB = memMB
+				if streamingPhaseStarted && strings.HasPrefix(s.Message, "Validating storage") {
+					s.Message = "Streaming & unpacking..."
+				}
 				if ramSampleCount > 0 {
 					s.AvgRamMB = ramSampleSum / float64(ramSampleCount)
 					s.PeakRamMB = peakRamMB
 				}
-				if runtime.GOOS == "linux" && tempC > 0 {
+				if tempC > 0 {
 					s.TempC = tempC
 					s.ThermalStatus = thermStatus
 				}
@@ -1275,6 +1346,10 @@ func executeTask(opts TaskOptions) {
 			lastTelemetryTime = now
 		}
 	}
+
+	manager.Update(func(s *ExtractionState) {
+		s.Message = "Streaming & unpacking..."
+	})
 
 	switch archiveType {
 	case ArchiveRAR5, ArchiveTar, ArchiveTarGz, ArchiveTarZst:
@@ -1753,16 +1828,44 @@ func openFolderInOS(folderPath string) error {
 		return nil
 	}
 	cleanPath := filepath.Clean(folderPath)
+
 	if runtime.GOOS == "windows" {
-		return exec.Command("explorer", cleanPath).Start()
+		return exec.Command("explorer.exe", cleanPath).Start()
 	} else if runtime.GOOS == "darwin" {
 		return exec.Command("open", cleanPath).Start()
 	} else if runtime.GOOS == "android" {
 		return nil
 	}
 
+	// Linux: Prefer D-Bus org.freedesktop.FileManager1.ShowFolders to focus and raise window above browser
+	uri := "file://" + cleanPath
 	if isFlatpakSandbox() {
+		if err := exec.Command("flatpak-spawn", "--host", "dbus-send", "--session",
+			"--dest=org.freedesktop.FileManager1", "--type=method_call",
+			"/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowFolders",
+			fmt.Sprintf("array:string:%s", uri), "string:").Run(); err == nil {
+			return nil
+		}
 		if err := exec.Command("flatpak-spawn", "--host", "xdg-open", cleanPath).Start(); err == nil {
+			return nil
+		}
+	}
+
+	if p, err := exec.LookPath("dbus-send"); err == nil {
+		if err := exec.Command(p, "--session",
+			"--dest=org.freedesktop.FileManager1", "--type=method_call",
+			"/org/freedesktop/FileManager1", "org.freedesktop.FileManager1.ShowFolders",
+			fmt.Sprintf("array:string:%s", uri), "string:").Run(); err == nil {
+			return nil
+		}
+	}
+
+	if p, err := exec.LookPath("gdbus"); err == nil {
+		if err := exec.Command(p, "call", "--session",
+			"--dest", "org.freedesktop.FileManager1",
+			"--object-path", "/org/freedesktop/FileManager1",
+			"--method", "org.freedesktop.FileManager1.ShowFolders",
+			fmt.Sprintf("['%s']", uri), "").Run(); err == nil {
 			return nil
 		}
 	}
@@ -1775,7 +1878,7 @@ func openFolderInOS(folderPath string) error {
 		return nil
 	}
 
-	for _, cmd := range []string{"nautilus", "dolphin", "thunar", "pcmanfm"} {
+	for _, cmd := range []string{"dolphin", "nautilus", "thunar", "pcmanfm"} {
 		if err := exec.Command(cmd, cleanPath).Start(); err == nil {
 			return nil
 		}
@@ -1792,17 +1895,44 @@ func handleOpenFolder(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Path string `json:"path"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Path == "" {
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
 		return
 	}
-	err := openFolderInOS(payload.Path)
+
+	targetPath := strings.TrimSpace(payload.Path)
+
+	// Resolve the exact extracted output subfolder if available
+	if manager != nil {
+		manager.mu.RLock()
+		finalDest := manager.state.FinalDest
+		baseDest := manager.lastTaskOpts.Dest
+		manager.mu.RUnlock()
+
+		if finalDest != "" {
+			if targetPath == "" || targetPath == baseDest || strings.HasPrefix(finalDest, filepath.Clean(targetPath)) {
+				if fi, err := os.Stat(finalDest); err == nil && fi.IsDir() {
+					targetPath = finalDest
+				}
+			}
+		}
+		if targetPath == "" && baseDest != "" {
+			targetPath = baseDest
+		}
+	}
+
+	if targetPath == "" {
+		targetPath = getDefaultDownloadsDir()
+	}
+
+	cleanPath := filepath.Clean(targetPath)
+	err := openFolderInOS(cleanPath)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error(), "path": cleanPath})
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "path": cleanPath})
 }
 
 func handleAddToSteam(w http.ResponseWriter, r *http.Request) {
@@ -2206,7 +2336,7 @@ func handleSpeedLimit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	globalSpeedLimitBytesPerSec.Store(int64(payload.SpeedLimitMBs) * 1024 * 1024)
+	setGlobalSpeedLimit(payload.SpeedLimitMBs)
 	manager.Update(func(s *ExtractionState) {
 		s.SpeedLimitMBs = payload.SpeedLimitMBs
 	})
@@ -2430,141 +2560,161 @@ func getActiveProgressSummaryJSON() string {
 	return string(data)
 }
 
+func spawnBrowserAppWindow(targetURL string) bool {
+	switch runtime.GOOS {
+	case "linux":
+		if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+			log.Printf("[BROWSER] Headless/console environment detected (no DISPLAY or WAYLAND_DISPLAY); skipping browser launch. Connect at %s", targetURL)
+			return false
+		}
+		userProfileDir := filepath.Join(getAppConfigDir(), "webapp-profile")
+		_ = os.MkdirAll(userProfileDir, 0755)
+
+		desktopPath := ""
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			desktopPath = filepath.Join(home, ".local", "share", "applications", "directcrate.desktop")
+		}
+		desktopEnv := []string{
+			"CHROME_DESKTOP=directcrate.desktop",
+		}
+		if desktopPath != "" {
+			desktopEnv = append(desktopEnv, "BAMF_DESKTOP_FILE_HINT="+desktopPath)
+		}
+
+		// 1. Prefer native Chromium-based browser binaries in standalone app window mode
+		nativeCandidates := []string{
+			"brave-browser",
+			"brave",
+			"google-chrome",
+			"google-chrome-stable",
+			"chromium",
+			"chromium-browser",
+			"microsoft-edge",
+			"vivaldi",
+		}
+		for _, bin := range nativeCandidates {
+			if _, err := exec.LookPath(bin); err == nil {
+				// Use --ozone-platform=x11: on native Wayland, Chromium/Brave overrides --class
+				// with a dynamic URL-based app_id in --app mode, whereas XWayland strictly honors
+				// WM_CLASS=DirectCrate to match StartupWMClass=DirectCrate in the .desktop file.
+				cmd := exec.Command(bin,
+					"--app="+targetURL,
+					"--class=DirectCrate",
+					"--name=DirectCrate",
+					"--ozone-platform=x11",
+					"--user-data-dir="+userProfileDir,
+					"--no-first-run",
+					"--no-default-browser-check",
+				)
+				cmd.Env = append(os.Environ(), desktopEnv...)
+				if err := cmd.Start(); err == nil {
+					return true
+				}
+			}
+		}
+
+		// 2. Check Flatpak Chromium-based browser installations (common on Bazzite, SteamOS, Silverblue)
+		if _, err := exec.LookPath("flatpak"); err == nil {
+			flatpakCandidates := []string{
+				"com.brave.Browser",
+				"com.google.Chrome",
+				"org.chromium.Chromium",
+				"com.microsoft.Edge",
+				"com.vivaldi.Vivaldi",
+			}
+			for _, appID := range flatpakCandidates {
+				if exec.Command("flatpak", "info", appID).Run() == nil {
+					flatpakArgs := []string{
+						"run",
+						"--filesystem=" + userProfileDir + ":create",
+						"--env=CHROME_DESKTOP=directcrate.desktop",
+					}
+					if desktopPath != "" {
+						flatpakArgs = append(flatpakArgs, "--env=BAMF_DESKTOP_FILE_HINT="+desktopPath)
+					}
+					flatpakArgs = append(flatpakArgs,
+						appID,
+						"--app="+targetURL,
+						"--class=DirectCrate",
+						"--name=DirectCrate",
+						"--ozone-platform=x11",
+						"--user-data-dir="+userProfileDir,
+						"--no-first-run",
+						"--no-default-browser-check",
+					)
+					cmd := exec.Command("flatpak", flatpakArgs...)
+					cmd.Env = append(os.Environ(), desktopEnv...)
+					if err := cmd.Start(); err == nil {
+						return true
+					}
+				}
+			}
+		}
+
+		// 3. Fallback to default browser tab via xdg-open
+		return exec.Command("xdg-open", targetURL).Start() == nil
+
+	case "windows":
+		var candidates []string
+		progFiles := os.Getenv("ProgramFiles")
+		progFilesX86 := os.Getenv("ProgramFiles(x86)")
+		localAppData := os.Getenv("LOCALAPPDATA")
+
+		knownPaths := []string{
+			filepath.Join(progFiles, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+			filepath.Join(progFilesX86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+			filepath.Join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+			filepath.Join(progFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+			filepath.Join(progFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+			filepath.Join(localAppData, "Microsoft", "Edge", "Application", "msedge.exe"),
+			filepath.Join(progFiles, "Google", "Chrome", "Application", "chrome.exe"),
+			filepath.Join(progFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+			filepath.Join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+		}
+		for _, p := range knownPaths {
+			if p != "" {
+				if _, err := os.Stat(p); err == nil {
+					candidates = append(candidates, p)
+				}
+			}
+		}
+		candidates = append(candidates, "brave", "msedge", "chrome")
+
+		userProfileDir := filepath.Join(getAppConfigDir(), "webapp-profile")
+		_ = os.MkdirAll(userProfileDir, 0755)
+
+		seen := make(map[string]bool)
+		for _, bin := range candidates {
+			if bin == "" || seen[bin] {
+				continue
+			}
+			seen[bin] = true
+			cmd := exec.Command(bin,
+				"--app="+targetURL,
+				"--class=DirectCrate",
+				"--user-data-dir="+userProfileDir,
+				"--no-first-run",
+				"--no-default-browser-check",
+			)
+			if err := cmd.Start(); err == nil {
+				return true
+			}
+		}
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", targetURL).Start() == nil
+
+	case "darwin":
+		return exec.Command("open", targetURL).Start() == nil
+	}
+	return false
+}
+
 func launchBrowser(targetURL string) {
 	if flag.Lookup("test.v") != nil {
 		return
 	}
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		switch runtime.GOOS {
-		case "linux":
-			if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
-				log.Printf("[BROWSER] Headless/console environment detected (no DISPLAY or WAYLAND_DISPLAY); skipping browser launch. Connect at %s", targetURL)
-				return
-			}
-			userProfileDir := filepath.Join(getAppConfigDir(), "webapp-profile")
-			_ = os.MkdirAll(userProfileDir, 0755)
-
-			desktopPath := ""
-			if home, err := os.UserHomeDir(); err == nil && home != "" {
-				desktopPath = filepath.Join(home, ".local", "share", "applications", "directcrate.desktop")
-			}
-			desktopEnv := []string{
-				"CHROME_DESKTOP=directcrate.desktop",
-			}
-			if desktopPath != "" {
-				desktopEnv = append(desktopEnv, "BAMF_DESKTOP_FILE_HINT="+desktopPath)
-			}
-
-			// 1. Prefer native Chromium-based browser binaries in standalone app window mode
-			nativeCandidates := []string{
-				"google-chrome",
-				"google-chrome-stable",
-				"chromium",
-				"chromium-browser",
-				"brave-browser",
-				"microsoft-edge",
-				"vivaldi",
-			}
-			for _, bin := range nativeCandidates {
-				if _, err := exec.LookPath(bin); err == nil {
-					cmd := exec.Command(bin,
-						"--app="+targetURL,
-						"--class=DirectCrate",
-						"--name=DirectCrate",
-						"--user-data-dir="+userProfileDir,
-					)
-					cmd.Env = append(os.Environ(), desktopEnv...)
-					if err := cmd.Start(); err == nil {
-						return
-					}
-				}
-			}
-
-			// 2. Check Flatpak Chromium-based browser installations (common on Bazzite, SteamOS, Silverblue)
-			if _, err := exec.LookPath("flatpak"); err == nil {
-				flatpakCandidates := []string{
-					"com.google.Chrome",
-					"org.chromium.Chromium",
-					"com.brave.Browser",
-					"com.microsoft.Edge",
-					"com.vivaldi.Vivaldi",
-				}
-				for _, appID := range flatpakCandidates {
-					if exec.Command("flatpak", "info", appID).Run() == nil {
-						// Omit --user-data-dir for Flatpak to avoid container sandbox path restriction errors
-						flatpakArgs := []string{
-							"run",
-							"--env=CHROME_DESKTOP=directcrate.desktop",
-						}
-						if desktopPath != "" {
-							flatpakArgs = append(flatpakArgs, "--env=BAMF_DESKTOP_FILE_HINT="+desktopPath)
-						}
-						flatpakArgs = append(flatpakArgs,
-							appID,
-							"--app="+targetURL,
-							"--class=DirectCrate",
-							"--name=DirectCrate",
-						)
-						cmd := exec.Command("flatpak", flatpakArgs...)
-						cmd.Env = append(os.Environ(), desktopEnv...)
-						if err := cmd.Start(); err == nil {
-							return
-						}
-					}
-				}
-			}
-
-			// 3. Fallback to default browser tab via xdg-open
-			_ = exec.Command("xdg-open", targetURL).Start()
-
-		case "windows":
-			// Prefer standalone app window via Edge or Chrome
-			var candidates []string
-			progFiles := os.Getenv("ProgramFiles")
-			progFilesX86 := os.Getenv("ProgramFiles(x86)")
-			localAppData := os.Getenv("LOCALAPPDATA")
-
-			knownPaths := []string{
-				filepath.Join(progFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
-				filepath.Join(progFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
-				filepath.Join(localAppData, "Microsoft", "Edge", "Application", "msedge.exe"),
-				filepath.Join(progFiles, "Google", "Chrome", "Application", "chrome.exe"),
-				filepath.Join(progFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
-				filepath.Join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
-				filepath.Join(progFiles, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-				filepath.Join(progFilesX86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-				filepath.Join(localAppData, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
-			}
-			for _, p := range knownPaths {
-				if p != "" {
-					if _, err := os.Stat(p); err == nil {
-						candidates = append(candidates, p)
-					}
-				}
-			}
-			candidates = append(candidates, "msedge", "chrome", "brave")
-
-			userProfileDir := filepath.Join(getAppConfigDir(), "webapp-profile")
-			_ = os.MkdirAll(userProfileDir, 0755)
-
-			seen := make(map[string]bool)
-			for _, bin := range candidates {
-				if bin == "" || seen[bin] {
-					continue
-				}
-				seen[bin] = true
-				cmd := exec.Command(bin, "--app="+targetURL, "--user-data-dir="+userProfileDir)
-				if err := cmd.Start(); err == nil {
-					return
-				}
-			}
-			// Fallback to default browser handler
-			_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", targetURL).Start()
-
-		case "darwin":
-			_ = exec.Command("open", targetURL).Start()
-		}
+		spawnBrowserAppWindow(targetURL)
 	}()
 }
 
@@ -2681,7 +2831,7 @@ func handleFocus(w http.ResponseWriter, r *http.Request) {
 		targetURL = "http://localhost:9090"
 	}
 	log.Printf("[LIFECYCLE] Received focus request; refocusing standalone app window: %s", targetURL)
-	go launchBrowser(targetURL)
+	go spawnBrowserAppWindow(targetURL)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -2727,12 +2877,52 @@ func focusExistingInstance(targetBaseURL string) {
 	}
 }
 
+// getInstanceLockPath returns the path to the single-instance lockfile in DirectCrate's config directory.
+func getInstanceLockPath() string {
+	return filepath.Join(getAppConfigDir(), "directcrate.lock")
+}
+
+// readInstanceLock reads the port recorded in directcrate.lock and validates if an active
+// DirectCrate server is responding on that port. If dead or stale, it cleans up the lockfile.
+func readInstanceLock() (int, bool) {
+	lockFile := getInstanceLockPath()
+	data, err := os.ReadFile(lockFile)
+	if err != nil {
+		return 0, false
+	}
+	portStr := strings.TrimSpace(string(data))
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return 0, false
+	}
+	probeTarget := fmt.Sprintf("http://127.0.0.1:%d", port)
+	if probeDirectCrateInstance(probeTarget) {
+		return port, true
+	}
+	_ = os.Remove(lockFile)
+	return 0, false
+}
+
+// writeInstanceLock stores the active listening port into directcrate.lock.
+func writeInstanceLock(port int) {
+	lockFile := getInstanceLockPath()
+	_ = os.MkdirAll(filepath.Dir(lockFile), 0755)
+	_ = os.WriteFile(lockFile, []byte(strconv.Itoa(port)), 0600)
+}
+
+// removeInstanceLock cleans up directcrate.lock on shutdown.
+func removeInstanceLock() {
+	lockFile := getInstanceLockPath()
+	_ = os.Remove(lockFile)
+}
+
 var (
 	globalServer     *http.Server
 	shutdownSignalCh = make(chan struct{}, 1)
 )
 
 func triggerGracefulExit() {
+	removeInstanceLock()
 	select {
 	case shutdownSignalCh <- struct{}{}:
 	default:
@@ -2936,18 +3126,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Single-instance enforcement on Desktop (Linux / Windows):
-	// Probe the configured port before binding or fallback. If another DirectCrate process
-	// is already running, instruct it to focus its window and exit immediately without writing
-	// duplicate startup logs or spawning duplicate background processes.
-	if runtime.GOOS != "android" && startPort > 0 {
-		probeTarget := fmt.Sprintf("http://127.0.0.1:%d", startPort)
-		if probeDirectCrateInstance(probeTarget) {
-			fmt.Printf("DirectCrate is already running on port %d; focusing existing instance.\n", startPort)
+	// Single-instance enforcement on Desktop (Linux / Windows / macOS):
+	// Check for an active lockfile storing running port, or probe startPort before binding.
+	// If another DirectCrate process is already running, open/focus its window and exit immediately.
+	if runtime.GOOS != "android" {
+		if activeLockPort, running := readInstanceLock(); running {
+			probeTarget := fmt.Sprintf("http://127.0.0.1:%d", activeLockPort)
+			fmt.Printf("DirectCrate is already running on port %d; opening browser.\n", activeLockPort)
 			if !*noOpenFlag {
 				focusExistingInstance(probeTarget)
+				spawnBrowserAppWindow(probeTarget)
 			}
 			os.Exit(0)
+		}
+		if startPort > 0 {
+			probeTarget := fmt.Sprintf("http://127.0.0.1:%d", startPort)
+			if probeDirectCrateInstance(probeTarget) {
+				fmt.Printf("DirectCrate is already running on port %d; focusing existing instance.\n", startPort)
+				if !*noOpenFlag {
+					focusExistingInstance(probeTarget)
+					spawnBrowserAppWindow(probeTarget)
+				}
+				os.Exit(0)
+			}
 		}
 	}
 
@@ -2970,6 +3171,10 @@ func main() {
 		os.Exit(1)
 	}
 	activeServerPort = activePort
+	if runtime.GOOS != "android" {
+		writeInstanceLock(activePort)
+		defer removeInstanceLock()
+	}
 
 	fmt.Println("DirectCrate — Direct-to-disk remote archive streamer")
 	if startPort != 0 && activePort != startPort {

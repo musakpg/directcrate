@@ -570,6 +570,13 @@ Keywords=directcrate;streamer;archive;unpacker;download;
 		_ = os.WriteFile(desktopPath, []byte(desktopContent), 0644)
 	}
 
+	// Also ensure DirectCrate.desktop exists so Wayland compositors matching app_id=DirectCrate find the desktop entry
+	directCrateDesktopPath := filepath.Join(appsDir, "DirectCrate.desktop")
+	existingDirectCrateDesktop, _ := os.ReadFile(directCrateDesktopPath)
+	if string(existingDirectCrateDesktop) != desktopContent {
+		_ = os.WriteFile(directCrateDesktopPath, []byte(desktopContent), 0644)
+	}
+
 	// 3. Silently update desktop database and icon cache in the background
 	go func() {
 		if p, err := exec.LookPath("update-desktop-database"); err == nil {

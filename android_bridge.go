@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -41,6 +42,13 @@ var (
 	bridgeServer  *http.Server
 	bridgeBaseURL string
 )
+
+func setTimezone(offsetSec int, name string) {
+	if name == "" {
+		name = "Local"
+	}
+	time.Local = time.FixedZone(name, offsetSec)
+}
 
 func jstringToString(env *C.JNIEnv, jstr C.jstring) string {
 	cStr := C.get_utf_chars(env, jstr)
@@ -71,7 +79,7 @@ func startServer(configDir, defaultDest string) int {
 	initLogging()
 	currentSettings = loadSettings()
 	if currentSettings.SpeedLimitMBs > 0 {
-		globalSpeedLimitBytesPerSec.Store(int64(currentSettings.SpeedLimitMBs) * 1024 * 1024)
+		setGlobalSpeedLimit(currentSettings.SpeedLimitMBs)
 	}
 
 	ln, activePort, err := listenWithFallback("127.0.0.1", 9090)
@@ -114,6 +122,13 @@ func StartServer(configDir, defaultDest string) int {
 // StopServer gracefully terminates the running embedded HTTP server.
 func StopServer() {
 	stopServer()
+}
+
+//export Java_com_musakpg_directcrate_DirectCrateBridge_setTimezone
+func Java_com_musakpg_directcrate_DirectCrateBridge_setTimezone(env *C.JNIEnv, clazz C.jclass, jOffset C.jint, jName C.jstring) {
+	offset := int(jOffset)
+	name := jstringToString(env, jName)
+	setTimezone(offset, name)
 }
 
 //export Java_com_musakpg_directcrate_DirectCrateBridge_startServer

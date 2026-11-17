@@ -14,72 +14,34 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 var (
 	bufferPoolsMu               sync.Mutex
 	bufferPools                 = make(map[int]*sync.Pool)
 	globalSpeedLimitBytesPerSec atomic.Int64
+	globalRateLimiter           = rate.NewLimiter(rate.Inf, 2*1024*1024)
 )
 
-type tokenBucket struct {
-	mu         sync.Mutex
-	tokens     float64
-	lastUpdate time.Time
-}
-
-var globalRateLimiter = &tokenBucket{}
-
-// waitN blocks until n bytes are permitted under the active atomic bandwidth cap.
-func (tb *tokenBucket) waitN(ctx context.Context, n int) error {
-	if n <= 0 {
-		return nil
-	}
-	for {
-		limit := globalSpeedLimitBytesPerSec.Load()
-		if limit <= 0 {
-			return nil
+// setGlobalSpeedLimit dynamically updates the rate limiter and atomic byte counter.
+// When limitMBs <= 0, bandwidth is unlimited. When > 0, rate.Limiter.SetLimit()
+// is updated live without interrupting active streaming connections.
+func setGlobalSpeedLimit(limitMBs int) {
+	if limitMBs <= 0 {
+		globalSpeedLimitBytesPerSec.Store(0)
+		globalRateLimiter.SetLimit(rate.Inf)
+		globalRateLimiter.SetBurst(2 * 1024 * 1024)
+	} else {
+		bps := int64(limitMBs) * 1024 * 1024
+		globalSpeedLimitBytesPerSec.Store(bps)
+		globalRateLimiter.SetLimit(rate.Limit(bps))
+		burst := int(bps / 4)
+		if burst < 512*1024 {
+			burst = 512 * 1024
 		}
-
-		tb.mu.Lock()
-		now := time.Now()
-		if tb.lastUpdate.IsZero() {
-			tb.lastUpdate = now
-			tb.tokens = float64(limit) * 0.25
-		}
-		elapsed := now.Sub(tb.lastUpdate).Seconds()
-		tb.lastUpdate = now
-		tb.tokens += elapsed * float64(limit)
-
-		maxBurst := float64(limit) * 0.25
-		if maxBurst < 256*1024 {
-			maxBurst = 256 * 1024
-		}
-		if tb.tokens > maxBurst {
-			tb.tokens = maxBurst
-		}
-
-		if tb.tokens >= float64(n) {
-			tb.tokens -= float64(n)
-			tb.mu.Unlock()
-			return nil
-		}
-
-		deficit := float64(n) - tb.tokens
-		waitDur := time.Duration((deficit / float64(limit)) * float64(time.Second))
-		if waitDur > 100*time.Millisecond {
-			waitDur = 100 * time.Millisecond
-		}
-		if waitDur < 5*time.Millisecond {
-			waitDur = 5 * time.Millisecond
-		}
-		tb.mu.Unlock()
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(waitDur):
-		}
+		globalRateLimiter.SetBurst(burst)
 	}
 }
 
@@ -102,7 +64,7 @@ func (r *rateLimitedReadCloser) Read(p []byte) (int, error) {
 
 	n, err := r.rc.Read(p)
 	if n > 0 {
-		if waitErr := globalRateLimiter.waitN(r.ctx, n); waitErr != nil {
+		if waitErr := globalRateLimiter.WaitN(r.ctx, n); waitErr != nil {
 			return n, waitErr
 		}
 	}

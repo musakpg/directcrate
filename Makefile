@@ -28,7 +28,7 @@ ifneq ($(ANDROID_HOME_CANDIDATE),)
 ANDROID_HOME := $(ANDROID_HOME_CANDIDATE)
 endif
 
-.PHONY: build build-all clean icons test test-all apk
+.PHONY: build build-binaries build-all clean icons test test-all apk
 
 icons:
 	go run scripts/gen_resources.go
@@ -47,14 +47,17 @@ apk: icons
 	@mkdir -p $(ANDROID_JNI_DIR) $(DIST_DIR)
 	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o $(ANDROID_JNI_DIR)/libdirectcrate.so .
 	cd android && ANDROID_HOME="$(ANDROID_HOME)" JAVA_HOME="$(JAVA_HOME)" PATH="$(JAVA_HOME)/bin:$(PATH)" ./gradlew assembleRelease --no-daemon --stacktrace
-	cp $(GRADLE_APK) $(DIST_DIR)/$(BINARY)-android-arm64.apk
+	cp $(GRADLE_APK) $(DIST_DIR)/$(BINARY)-android.apk
+	cd $(DIST_DIR) && sha256sum $(BINARY)-android.apk > $(BINARY)-android.apk.sha256
 
-build-all: icons apk
+build-binaries: icons
 	@mkdir -p $(DIST_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY)-linux-amd64 .
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY)-linux-arm64 .
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY)-windows-amd64.exe .
 	CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -ldflags="$(LDFLAGS)" -o $(DIST_DIR)/$(BINARY)-android-arm64 .
+
+build-all: build-binaries apk
 
 clean:
 	rm -rf $(DIST_DIR) $(BINARY) $(ANDROID_JNI_DIR) android/.gradle android/build android/app/build coverage.out

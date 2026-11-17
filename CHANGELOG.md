@@ -5,6 +5,30 @@ All notable changes to DirectCrate are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-17
+
+### Desktop Integration & Process Lifecycle
+- **Brave & Chromium Isolation on Linux (`--class=DirectCrate`)**: Prevented window hijacking where launched DirectCrate app windows would attach to the user's running Brave or Chrome instances and group under the browser's dock icon. Standalone `--app` mode now launches with `--class=DirectCrate`, `--name=DirectCrate`, `--user-data-dir` inside DirectCrate's config directory, `--no-first-run`, and `--no-default-browser-check` across native Chromium browsers and Flatpaks (`--filesystem=...:create`).
+- **Wayland Window & Taskbar Icon Matching**: Added `DirectCrate.desktop` alongside `directcrate.desktop` in `~/.local/share/applications/` matching `StartupWMClass=DirectCrate`, ensuring Wayland and KDE Plasma properly display the DirectCrate icon instead of a generic "W" or browser icon.
+- **Single-Instance Lock (`directcrate.lock`)**: Implemented persistent lockfile tracking the active server port. Subsequent CLI or app launcher invocations detect the running instance, trigger window focus via `POST /api/focus` and standalone app window spawn, and exit immediately with exit code 0 without creating duplicate background processes.
+- **Accurate "Open Folder" Target & Window Elevation**:
+  - Resolved exact extracted output subfolder (including subfolder override or auto-detected root folder) rather than the generic parent downloads directory.
+  - On Linux, prefer D-Bus `org.freedesktop.FileManager1.ShowFolders` (via `dbus-send` or `gdbus`, with Flatpak fallback) to open and focus the file manager (Dolphin / Nautilus) above the browser window.
+  - On Windows, launch `explorer.exe /select` or direct folder path for clean native elevation.
+
+### Core Telemetry, Speed Capping & UI Polish
+- **EMA Speed & ETA Smoothing**: Replaced noisy instantaneous speed division with Exponential Moving Average (`smoothedSpeed = 0.2 * currentSpeed + 0.8 * smoothedSpeed`) in backend telemetry and Web UI, and throttled ETA text updates to once per second to prevent flickering.
+- **Zero Layout Jitter**: Constrained active file path box (`.current-file`, `#curFile`) to a fixed single-line height (`height: 1.35em`) with `text-overflow: ellipsis`, and applied `font-variant-numeric: tabular-nums` across all telemetry counters and metrics.
+- **Live Speed Cap via Token-Bucket Rate Limiter**: Upgraded `golang.org/x/time/rate` with dynamic `rate.Limiter.SetLimit()` and `SetBurst()` calls wired directly to the live speed limit dropdown, applying speed throttling immediately without restarting active connections.
+- **Stream State Setting Locking**: Automatically locked static stream parameters (`Parallel HTTP Connections` and `I/O Stream Buffer Size`) while downloads are active, showing `🔒 Applies to next download (locked during active stream)`, and re-enabling them when idle.
+- **Extended Buffer Size Options**: Added `32 MB` (Extreme LAN / NVMe) and `64 MB` (Maximum Throughput) options to the I/O Stream Buffer Size dropdown and updated FAQ guides.
+- **Immediate Phase Status Transition**: Transitioned status label from `"Validating storage & probing..."` to `"Streaming & unpacking..."` immediately when writing/streaming begins.
+
+### Platform Specifics & Distribution
+- **Android Local Timezone Synchronization**: Passed Android device local timezone offset to Go backend via JNI (`time.Local = time.FixedZone(name, offsetSeconds)`), ensuring application logs, history timestamps, and completions display accurate device local time instead of UTC.
+- **Single Android APK Output**: Consolidated Android build workflow and `Makefile` to produce a single standard release artifact (`dist/directcrate-android.apk` and `dist/directcrate-android.apk.sha256`).
+- **Windows ACPI / WMI Thermal Querying**: Added `MSAcpi_ThermalZoneTemperature` WMI fallback query on Windows, maintaining clean `--` display and adding FAQ explanation when restricted by hardware vendors (e.g. AMD Ryzen Z1 Extreme on ROG Ally / Lenovo Legion Go).
+
 ## [1.0.0] - 2026-11-14
 
 ### Initial Production Release

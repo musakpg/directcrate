@@ -296,6 +296,15 @@
 			width: 100%;
 			user-select: none;
 		}
+		.custom-select-wrapper.disabled {
+			opacity: 0.55;
+			cursor: not-allowed;
+		}
+		.custom-select-trigger:disabled {
+			opacity: 0.55;
+			cursor: not-allowed;
+			pointer-events: none;
+		}
 		.custom-select-wrapper.inline-select {
 			display: inline-block;
 			width: auto;
@@ -744,6 +753,10 @@
 			white-space: nowrap;
 			overflow: hidden;
 			text-overflow: ellipsis;
+			font-variant-numeric: tabular-nums;
+		}
+		.hero-speed-val, .hero-eta-val, #speed, #eta, #percentVal, #payload, #storage, #appRam, #deviceTemp, #filesCount, #avgSpeedLabel, #peakSpeedLabel {
+			font-variant-numeric: tabular-nums;
 		}
 		.temp-normal { color: #10B981; }
 		.temp-warm { color: #F59E0B; }
@@ -776,6 +789,8 @@
 			display: flex;
 			justify-content: space-between;
 			gap: 12px;
+			min-height: 1.35em;
+			line-height: 1.35em;
 		}
 		.status-text {
 			white-space: nowrap;
@@ -785,6 +800,10 @@
 		.current-file, #curFile {
 			margin-top: 4px;
 			font-size: 0.74rem;
+			height: 1.35em;
+			min-height: 1.35em;
+			max-height: 1.35em;
+			line-height: 1.35em;
 			color: var(--text-dim);
 			font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 			white-space: nowrap;
@@ -2355,7 +2374,10 @@
 							<option value="4" selected>4 MB (Balanced Default)</option>
 							<option value="8">8 MB (High-Speed NVMe & WiFi 6E)</option>
 							<option value="16">16 MB (Maximum Gigabit / Desktop Throughput)</option>
+							<option value="32">32 MB (Extreme 2.5G/10G LAN / High-End NVMe)</option>
+							<option value="64">64 MB (Maximum Buffer / Ultra-High Throughput)</option>
 						</select>
+						<div id="prefStreamLockNotice" style="display: none; font-size: 0.78rem; color: var(--text-muted); margin-top: 6px;">🔒 Applies to next download (locked during active stream)</div>
 					</div>
 
 					<div class="field" style="margin-top: 12px;">
@@ -2474,6 +2496,17 @@
 							</div>
 						</div>
 
+						<div class="faq-card" data-category="performance" id="faq-card-windows-thermals">
+							<button class="faq-question" type="button" aria-expanded="false" onclick="toggleFaqAccordion(this)">
+								<div class="faq-q-left">
+									<span class="faq-category-badge">Performance & Thermals</span>
+									<span class="faq-q-text">Why does Device Temp show "--" on Windows or ROG Ally / Legion Go?</span>
+								</div>
+								<svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+							</button>
+							<div class="faq-answer">On Windows, DirectCrate attempts to query the ACPI thermal zone via WMI (<code>MSAcpi_ThermalZoneTemperature</code>). However, on modern gaming handhelds (such as the ASUS ROG Ally with AMD Ryzen Z1 Extreme or Lenovo Legion Go) and certain desktop motherboards, hardware vendors restrict access to ACPI thermal sensors to kernel-level drivers or vendor-proprietary software (such as Armoury Crate). In these cases, DirectCrate cleanly displays <code>--</code> rather than showing misleading or stale readings. Real-time extraction throughput and all other telemetry metrics remain fully functional.</div>
+						</div>
+
 						<div class="faq-card" data-category="performance" id="faq-card-preferences-tuning">
 							<button class="faq-question" type="button" aria-expanded="false" onclick="toggleFaqAccordion(this)">
 								<div class="faq-q-left">
@@ -2485,7 +2518,7 @@
 							<div class="faq-answer">DirectCrate's Preferences allow you to fine-tune network, memory, disk, and lifecycle behavior:
 								<ul style="margin: 6px 0 0 0; padding-left: 18px; line-height: 1.55;">
 									<li><b>Parallel HTTP Connections (1, 2, 4, 8):</b> Controls how many concurrent worker streams fetch chunk ranges simultaneously (default 4). Select <b>8</b> on fast multi-gigabit fiber connections to maximize throughput. Drop to <b>1 or 2</b> if a host server enforces aggressive rate limiting (returning HTTP <code>403 Forbidden</code> or <code>429 Too Many Requests</code>), or on unstable cellular networks.</li>
-									<li><b>I/O Stream Buffer Size (1 MB to 16 MB):</b> Configures the memory buffer size recycled via <code>sync.Pool</code> during decompression (default 4 MB). Use <b>1 MB or 2 MB</b> on low-RAM smartphones (2–4 GB RAM) to minimize memory pressure. Keep <b>4 MB</b> for balanced mobile/desktop use. Use <b>8 MB or 16 MB</b> on high-speed NVMe SSDs and Wi-Fi 6E/Ethernet to reduce drive write IOPS and increase sustained write speeds.</li>
+									<li><b>I/O Stream Buffer Size (1 MB to 64 MB):</b> Configures the memory buffer size recycled via <code>sync.Pool</code> during decompression (default 4 MB). Use <b>1 MB or 2 MB</b> on low-RAM smartphones (2–4 GB RAM) to minimize memory pressure. Keep <b>4 MB</b> for balanced mobile/desktop use. Use <b>8 MB, 16 MB, 32 MB, or 64 MB</b> on high-speed NVMe SSDs and multi-gigabit LAN/Ethernet to minimize I/O syscalls and maximize sustained disk throughput.</li>
 									<li><b>Folder Conflict Policy:</b> Determines behavior when the target folder already exists: <i>Ask Every Time</i> prompts you; <i>Merge with Existing</i> overwrites identical files while keeping unique ones; <i>Clean & Overwrite</i> wipes the folder first; <i>Auto-Rename</i> appends an incremental suffix (<code>_2</code>, <code>_3</code>).</li>
 									<li><b>Flatten Single Root Folder:</b> Automatically eliminates redundant nested parent folders (e.g. <code>Game/Game/game.exe</code> is automatically hoisted into <code>Game/game.exe</code>).</li>
 									<li><b>Auto Checksum Verification:</b> Automatically detects and verifies checksum files (<code>.sha256</code>, <code>sha256sums.txt</code>, <code>.md5</code>) in the root of the extracted folder upon completion.</li>
@@ -2899,6 +2932,7 @@
 							<button class="prompt-chip" type="button" onclick="submitQuickHelp('Why does my phone get warm?')">Why does my phone get warm?</button>
 							<button class="prompt-chip" type="button" onclick="submitQuickHelp('How to download password protected .7z?')">How to download password protected .7z?</button>
 							<button class="prompt-chip" type="button" onclick="submitQuickHelp('How to limit download speed?')">How to limit download speed?</button>
+							<button class="prompt-chip" type="button" onclick="submitQuickHelp('Why does Device Temp show -- on Windows?')">Why does Device Temp show -- on Windows?</button>
 						</div>
 					</div>
 
@@ -2914,7 +2948,7 @@
 				</div>
 
 				<div class="tab-pane" id="tab-about">
-					<div style="font-weight: 600; font-size: 0.95rem; color: var(--text); margin-bottom: 6px;">DirectCrate v1.0.0</div>
+					<div style="font-weight: 600; font-size: 0.95rem; color: var(--text); margin-bottom: 6px;">DirectCrate v1.0.1</div>
 					<p style="margin: 0 0 12px 0; color: var(--text-muted); line-height: 1.5; font-size: 0.82rem;">
 						Direct-to-disk remote archive streamer engineered for storage-constrained devices including Steam Deck, ROG Ally, Bazzite/SteamOS handhelds, Linux & Windows desktops, and Android 15/16 mobile environments.
 					</p>
@@ -2986,7 +3020,7 @@
 					<!-- Update Check Section -->
 					<div style="margin-bottom: 12px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;">
 						<div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; margin-bottom: 8px;">
-							<span>Installed Version: <b style="color: var(--text);">v1.0.0</b></span>
+							<span>Installed Version: <b style="color: var(--text);">v1.0.1</b></span>
 							<span id="manualUpdateStatus" style="font-size: 0.76rem; color: var(--text-dim);">Up to date</span>
 						</div>
 						<div style="display: flex; gap: 8px;">
@@ -3318,10 +3352,10 @@
 					showToast('Update check failed: ' + data.error, 'error');
 				} else {
 					if (statusEl) {
-						statusEl.textContent = 'You are on the latest version (v1.0.0)';
+						statusEl.textContent = 'You are on the latest version (v1.0.1)';
 						statusEl.style.color = 'var(--text-muted)';
 					}
-					showToast('DirectCrate is up to date (v1.0.0)', 'info');
+					showToast('DirectCrate is up to date (v1.0.1)', 'info');
 				}
 			} catch (e) {
 				if (statusEl) {
@@ -3509,7 +3543,7 @@
 		let activeLogPath = "";
 		let systemOS = "";
 		let systemArch = "";
-		let directcrateVersion = "v1.0.0";
+		let directcrateVersion = "v1.0.1";
 		let isExtractionActive = false;
 		let lastErrorMessage = "";
 		let lastNotificationUpdate = 0;
@@ -3998,6 +4032,12 @@
 			menu.setAttribute('role', 'listbox');
 
 			function rebuildOptions() {
+				trigger.disabled = Boolean(select.disabled);
+				if (select.disabled) {
+					wrapper.classList.add('disabled');
+				} else {
+					wrapper.classList.remove('disabled');
+				}
 				menu.innerHTML = '';
 				let selectedText = '';
 				Array.from(select.options).forEach((opt) => {
@@ -4016,6 +4056,7 @@
 					}
 					item.addEventListener('click', (e) => {
 						e.stopPropagation();
+						if (select.disabled || trigger.disabled) return;
 						if (select.value !== opt.value) {
 							select.value = opt.value;
 							select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -4025,6 +4066,7 @@
 						trigger.focus();
 					});
 					item.addEventListener('keydown', (e) => {
+						if (select.disabled || trigger.disabled) return;
 						if (e.key === 'Enter' || e.key === ' ') {
 							e.preventDefault();
 							item.click();
@@ -4039,6 +4081,12 @@
 			}
 
 			function syncUI() {
+				trigger.disabled = Boolean(select.disabled);
+				if (select.disabled) {
+					wrapper.classList.add('disabled');
+				} else {
+					wrapper.classList.remove('disabled');
+				}
 				let selectedText = '';
 				menu.querySelectorAll('.custom-select-option').forEach(item => {
 					if (item.dataset.value === select.value) {
@@ -4054,6 +4102,7 @@
 			}
 
 			function openMenu() {
+				if (select.disabled || trigger.disabled) return;
 				closeAllCustomSelects();
 				wrapper.classList.add('open');
 				trigger.setAttribute('aria-expanded', 'true');
@@ -4066,6 +4115,7 @@
 
 			trigger.addEventListener('click', (e) => {
 				e.stopPropagation();
+				if (select.disabled || trigger.disabled) return;
 				if (wrapper.classList.contains('open')) {
 					closeMenu();
 				} else {
@@ -4074,6 +4124,7 @@
 			});
 
 			trigger.addEventListener('keydown', (e) => {
+				if (select.disabled || trigger.disabled) return;
 				if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === ' ') {
 					e.preventDefault();
 					if (!wrapper.classList.contains('open')) {
@@ -4391,6 +4442,9 @@
 		}
 
 		let lastCurFileText = '';
+		let uiSmoothedSpeed = 0;
+		let lastEtaUpdate = 0;
+		let lastEtaDisplay = '--:--';
 		function updateCurFileDisplay(text) {
 			const raw = text || '-';
 			if (raw === lastCurFileText) return;
@@ -4461,9 +4515,44 @@
 				pill.textContent = `Saved ~${savedStr} temp storage • ${streams} streams • ${retries} retries`;
 			}
 
-			document.getElementById('speed').textContent = speedMbs.toFixed(1) + ' MB/s';
+			// Lock static settings during active stream (Applies to next download)
+			const parallelSelect = document.getElementById('prefParallelConns');
+			const bufferSelect = document.getElementById('prefBufferSize');
+			const streamLockNotice = document.getElementById('prefStreamLockNotice');
+			const isStreamingActive = (data.status === 'running');
+			if (parallelSelect && parallelSelect.disabled !== isStreamingActive) {
+				parallelSelect.disabled = isStreamingActive;
+				if (bufferSelect) bufferSelect.disabled = isStreamingActive;
+				if (streamLockNotice) streamLockNotice.style.display = isStreamingActive ? 'block' : 'none';
+				syncAllCustomSelects();
+			}
+
+			// EMA smoothing for speed readout: smoothed = 0.2 * current + 0.8 * smoothed
+			if (speedMbs > 0) {
+				if (uiSmoothedSpeed <= 0) {
+					uiSmoothedSpeed = speedMbs;
+				} else {
+					uiSmoothedSpeed = 0.2 * speedMbs + 0.8 * uiSmoothedSpeed;
+				}
+			} else if (data.status !== 'running') {
+				uiSmoothedSpeed = 0;
+			}
+			const displaySpeed = (data.status === 'running' && uiSmoothedSpeed > 0) ? uiSmoothedSpeed : speedMbs;
+			document.getElementById('speed').textContent = displaySpeed.toFixed(1) + ' MB/s';
 			document.getElementById('peakSpeedLabel').textContent = 'Peak: ' + (data.peak_speed_mbs || 0).toFixed(1) + ' MB/s';
-			document.getElementById('eta').textContent = data.eta || '--:--';
+
+			// Throttle ETA text updates to once every 1 second
+			const now = Date.now();
+			if (data.status !== 'running') {
+				lastEtaDisplay = '--:--';
+				document.getElementById('eta').textContent = '--:--';
+			} else if (now - lastEtaUpdate >= 1000 || !lastEtaDisplay || lastEtaDisplay === '--:--') {
+				lastEtaUpdate = now;
+				lastEtaDisplay = data.eta || '--:--';
+				document.getElementById('eta').textContent = lastEtaDisplay;
+			} else {
+				document.getElementById('eta').textContent = lastEtaDisplay;
+			}
 
 			if (typeof data.mem_mb === 'number' && data.mem_mb > 0) {
 				const ramEl = document.getElementById('appRam');
@@ -4584,7 +4673,10 @@
 				document.getElementById('storage').textContent = data.free_disk_gb.toFixed(1) + ' GB';
 			}
 
-			const displayMsg = translatePlainErrorMessage(data.message);
+			let displayMsg = translatePlainErrorMessage(data.message);
+			if (data.status === 'running' && (downloadedMb > 0 || speedMbs > 0) && displayMsg && displayMsg.startsWith('Validating storage')) {
+				displayMsg = 'Streaming & unpacking...';
+			}
 			const statusMsgEl = document.getElementById('statusMsg');
 			if (statusMsgEl) {
 				statusMsgEl.textContent = displayMsg;
@@ -5416,6 +5508,19 @@ DirectCrate automatically detects AES-256 encrypted .7z and password-protected .
 				};
 			}
 
+			if (q.includes('windows temp') || q.includes('rog ally') || q.includes('z1 extreme') || q.includes('device temp --') || q.includes('-- °c') || q.includes('wmi') || q.includes('acpi') || q.includes('legion go')) {
+				return {
+					badge: 'Thermals',
+					title: 'Windows & Handheld Device Temp Sensor',
+					text: `<b>Device Temp Sensor on Windows:</b><br>
+On Windows, DirectCrate queries the ACPI thermal zone via WMI. On handhelds like the ROG Ally (AMD Z1 Extreme) or Lenovo Legion Go, hardware vendors restrict thermal queries to kernel drivers or proprietary tools (like Armoury Crate).<br><br>
+When restricted, DirectCrate cleanly displays <code>--</code>. All stream protections and speed limit options function normally.`,
+					actions: [
+						`<button class="shortcut-btn" type="button" onclick="jumpToFaq('faq-card-windows-thermals')">[View FAQ: Windows Thermals]</button>`
+					]
+				};
+			}
+
 			if (q.includes('warm') || q.includes('hot') || q.includes('heat') || q.includes('temp') || q.includes('battery') || q.includes('fan') || q.includes('speed limit') || q.includes('cap') || q.includes('thermal') || q.includes('limit')) {
 				return {
 					badge: 'Thermals',
@@ -5815,7 +5920,7 @@ All streaming activity, HTTP status codes, and engine errors are logged locally 
 			const platformStr = [systemOS, systemArch].filter(Boolean).join('/') || navigator.platform || 'Unknown';
 			const report = [
 				'### DirectCrate Diagnostic Report',
-				'- **Version:** ' + (directcrateVersion || 'v1.0.0'),
+				'- **Version:** ' + (directcrateVersion || 'v1.0.1'),
 				'- **OS / Arch:** ' + platformStr,
 				'- **Browser:** ' + navigator.userAgent,
 				'- **Timestamp:** ' + new Date().toISOString(),
