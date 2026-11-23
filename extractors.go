@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bodgit/sevenzip"
@@ -208,6 +209,326 @@ func (w *diskCheckingWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+const (
+	desktopAsyncWriteBufSize = 4 * 1024 * 1024 // 4MB async bufio + double-buffer on Desktop
+	androidAsyncWriteBufSize = 512 * 1024      // 512KB async bufio + double-buffer on Android
+)
+
+var (
+	asyncStagePoolsMu  sync.Mutex
+	asyncStagePools    = make(map[int]*sync.Pool)
+	asyncBufioPoolsMu  sync.Mutex
+	asyncBufioPools    = make(map[int]*sync.Pool)
+)
+
+func asyncWriterBufferSizeForOS(goos string) int {
+	if goos == "android" {
+		return androidAsyncWriteBufSize
+	}
+	return desktopAsyncWriteBufSize
+}
+
+func acquireAsyncStageBuf(size int) []byte {
+	asyncStagePoolsMu.Lock()
+	pool, ok := asyncStagePools[size]
+	if !ok {
+		sz := size
+		pool = &sync.Pool{
+			New: func() interface{} {
+				return make([]byte, sz)
+			},
+		}
+		asyncStagePools[size] = pool
+	}
+	asyncStagePoolsMu.Unlock()
+	return pool.Get().([]byte)[:size]
+}
+
+func releaseAsyncStageBuf(size int, buf []byte) {
+	if buf == nil || cap(buf) < size {
+		return
+	}
+	asyncStagePoolsMu.Lock()
+	pool, ok := asyncStagePools[size]
+	asyncStagePoolsMu.Unlock()
+	if ok {
+		pool.Put(buf[:size])
+	}
+}
+
+func acquireAsyncBufioWriter(target io.Writer, size int) *bufio.Writer {
+	asyncBufioPoolsMu.Lock()
+	pool, ok := asyncBufioPools[size]
+	if !ok {
+		sz := size
+		pool = &sync.Pool{
+			New: func() interface{} {
+				return bufio.NewWriterSize(io.Discard, sz)
+			},
+		}
+		asyncBufioPools[size] = pool
+	}
+	asyncBufioPoolsMu.Unlock()
+
+	bw := pool.Get().(*bufio.Writer)
+	bw.Reset(target)
+	return bw
+}
+
+func releaseAsyncBufioWriter(bw *bufio.Writer, size int) {
+	if bw == nil {
+		return
+	}
+	bw.Reset(io.Discard)
+	asyncBufioPoolsMu.Lock()
+	pool, ok := asyncBufioPools[size]
+	asyncBufioPoolsMu.Unlock()
+	if ok {
+		pool.Put(bw)
+	}
+}
+
+// asyncBufferedWriter wraps an io.Writer with a double-buffered asynchronous writer goroutine
+// paired with a pooled bufio.Writer (4MB on desktop, 512KB on Android) so decompression and
+// disk I/O run concurrently with deterministic flushing and error propagation.
+type asyncBufferedWriter struct {
+	ctx       context.Context
+	bufSize   int
+	bufWriter *bufio.Writer
+	freeCh    chan []byte
+	workCh    chan []byte
+	doneCh    chan struct{}
+	activeBuf []byte
+	activeLen int
+	mu        sync.Mutex
+	writeErr  error
+	closed    bool
+}
+
+func newAsyncBufferedWriter(ctx context.Context, target io.Writer) *asyncBufferedWriter {
+	return newAsyncBufferedWriterWithSize(ctx, target, asyncWriterBufferSizeForOS(runtime.GOOS))
+}
+
+func newAsyncBufferedWriterWithSize(ctx context.Context, target io.Writer, bufSize int) *asyncBufferedWriter {
+	if bufSize <= 0 {
+		bufSize = asyncWriterBufferSizeForOS(runtime.GOOS)
+	}
+	bw := acquireAsyncBufioWriter(target, bufSize)
+	w := &asyncBufferedWriter{
+		ctx:       ctx,
+		bufSize:   bufSize,
+		bufWriter: bw,
+		freeCh:    make(chan []byte, 2),
+		workCh:    make(chan []byte, 2),
+		doneCh:    make(chan struct{}),
+	}
+	// Pre-populate double buffers from sync.Pool
+	w.freeCh <- acquireAsyncStageBuf(bufSize)
+	w.activeBuf = acquireAsyncStageBuf(bufSize)
+	w.activeLen = 0
+
+	go w.writerLoop()
+	return w
+}
+
+func (w *asyncBufferedWriter) setError(err error) {
+	if err == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.writeErr == nil {
+		w.writeErr = err
+	}
+	w.mu.Unlock()
+}
+
+func (w *asyncBufferedWriter) getError() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeErr
+}
+
+func (w *asyncBufferedWriter) writerLoop() {
+	defer close(w.doneCh)
+
+	for chunk := range w.workCh {
+		if w.getError() != nil {
+			releaseAsyncStageBuf(w.bufSize, chunk)
+			continue
+		}
+		if w.ctx.Err() != nil {
+			w.setError(w.ctx.Err())
+			releaseAsyncStageBuf(w.bufSize, chunk)
+			continue
+		}
+		_, err := w.bufWriter.Write(chunk)
+		if err != nil {
+			w.setError(err)
+			releaseAsyncStageBuf(w.bufSize, chunk)
+			continue
+		}
+		select {
+		case w.freeCh <- chunk[:w.bufSize]:
+		default:
+			releaseAsyncStageBuf(w.bufSize, chunk)
+		}
+	}
+
+	if w.getError() == nil {
+		if w.ctx.Err() != nil {
+			w.setError(w.ctx.Err())
+		} else if flushErr := w.bufWriter.Flush(); flushErr != nil {
+			w.setError(flushErr)
+		}
+	}
+}
+
+func (w *asyncBufferedWriter) flushActiveBuffer() error {
+	if w.activeLen == 0 {
+		return nil
+	}
+	if err := w.getError(); err != nil {
+		return err
+	}
+	if w.ctx.Err() != nil {
+		w.setError(w.ctx.Err())
+		return w.ctx.Err()
+	}
+
+	toSend := w.activeBuf[:w.activeLen]
+	w.activeBuf = nil
+	w.activeLen = 0
+
+	select {
+	case <-w.ctx.Done():
+		releaseAsyncStageBuf(w.bufSize, toSend)
+		w.setError(w.ctx.Err())
+		return w.ctx.Err()
+	case <-w.doneCh:
+		releaseAsyncStageBuf(w.bufSize, toSend)
+		if err := w.getError(); err != nil {
+			return err
+		}
+		return io.ErrClosedPipe
+	case w.workCh <- toSend:
+	}
+	return w.getError()
+}
+
+func (w *asyncBufferedWriter) ensureActiveBuffer() error {
+	if w.activeBuf != nil {
+		return nil
+	}
+	select {
+	case <-w.ctx.Done():
+		w.setError(w.ctx.Err())
+		return w.ctx.Err()
+	case <-w.doneCh:
+		if err := w.getError(); err != nil {
+			return err
+		}
+		return io.ErrClosedPipe
+	case nextBuf := <-w.freeCh:
+		if err := w.getError(); err != nil {
+			releaseAsyncStageBuf(w.bufSize, nextBuf)
+			return err
+		}
+		w.activeBuf = nextBuf[:w.bufSize]
+		w.activeLen = 0
+		return nil
+	}
+}
+
+func (w *asyncBufferedWriter) Write(p []byte) (int, error) {
+	if err := w.getError(); err != nil {
+		return 0, err
+	}
+	if w.ctx.Err() != nil {
+		w.setError(w.ctx.Err())
+		return 0, w.ctx.Err()
+	}
+
+	totalWritten := 0
+	for len(p) > 0 {
+		if err := w.ensureActiveBuffer(); err != nil {
+			return totalWritten, err
+		}
+		avail := w.bufSize - w.activeLen
+		n := copy(w.activeBuf[w.activeLen:w.bufSize], p)
+		w.activeLen += n
+		totalWritten += n
+		p = p[n:]
+
+		if n == avail || w.activeLen >= w.bufSize {
+			if err := w.flushActiveBuffer(); err != nil {
+				return totalWritten, err
+			}
+		}
+	}
+	return totalWritten, w.getError()
+}
+
+// Close flushes all pending buffers, waits deterministically for the background writer
+// goroutine to finish, recycles pooled buffers, and returns any write or flush error.
+func (w *asyncBufferedWriter) Close() error {
+	w.mu.Lock()
+	if w.closed {
+		err := w.writeErr
+		w.mu.Unlock()
+		return err
+	}
+	w.closed = true
+	w.mu.Unlock()
+
+	if w.activeLen > 0 && w.getError() == nil && w.ctx.Err() == nil {
+		_ = w.flushActiveBuffer()
+	}
+	if w.activeBuf != nil {
+		releaseAsyncStageBuf(w.bufSize, w.activeBuf)
+		w.activeBuf = nil
+		w.activeLen = 0
+	}
+
+	close(w.workCh)
+	<-w.doneCh
+
+	for {
+		select {
+		case b := <-w.freeCh:
+			releaseAsyncStageBuf(w.bufSize, b)
+		default:
+			releaseAsyncBufioWriter(w.bufWriter, w.bufSize)
+			w.bufWriter = nil
+			return w.getError()
+		}
+	}
+}
+
+// writeEntryToFile pre-allocates disk blocks when uncompressedSize > 0, streams through
+// diskCheckingWriter and asyncBufferedWriter, and guarantees deterministic flush & close.
+func writeEntryToFile(ctx context.Context, outFile *os.File, destDir string, minFloorMB int, uncompressedSize int64, src io.Reader, copyBuf []byte) (int64, error) {
+	if uncompressedSize > 0 {
+		if preErr := preallocateFile(outFile, uncompressedSize); preErr != nil {
+			_ = outFile.Close()
+			return 0, preErr
+		}
+	}
+
+	diskWriter := newDiskCheckingWriter(outFile, destDir, minFloorMB)
+	asyncWriter := newAsyncBufferedWriter(ctx, diskWriter)
+	written, copyErr := io.CopyBuffer(asyncWriter, src, copyBuf)
+	flushErr := asyncWriter.Close()
+	closeErr := outFile.Close()
+
+	if copyErr != nil {
+		return written, copyErr
+	}
+	if flushErr != nil {
+		return written, flushErr
+	}
+	return written, closeErr
 }
 
 // normalizeTargetPath handles Windows extended paths (>240 chars) with \\?\ prefix.
@@ -780,15 +1101,12 @@ func extractRAR(ctx context.Context, r io.Reader, baseOutputDir string, autoSubf
 			s.FinalDest = actualOutputDir
 		})
 
-		diskWriter := newDiskCheckingWriter(outFile, actualOutputDir, midStreamMinMB)
-		bufWriter := bufio.NewWriterSize(diskWriter, 256*1024)
-		written, err := io.CopyBuffer(bufWriter, rr, buf)
-		flushErr := bufWriter.Flush()
-		_ = outFile.Close()
-		manager.ClearActiveFile()
-		if err == nil && flushErr != nil {
-			err = flushErr
+		var preallocSz int64
+		if !header.UnKnownSize && header.UnPackedSize > 0 {
+			preallocSz = header.UnPackedSize
 		}
+		written, err := writeEntryToFile(ctx, outFile, actualOutputDir, midStreamMinMB, preallocSz, rr, buf)
+		manager.ClearActiveFile()
 
 		if err != nil {
 			_ = os.Remove(targetPath)
@@ -949,15 +1267,7 @@ func extractTarStream(ctx context.Context, r io.Reader, archiveType ArchiveType,
 			s.FinalDest = actualOutputDir
 		})
 
-		diskWriter := newDiskCheckingWriter(outFile, actualOutputDir, midStreamMinMB)
-		bufWriter := bufio.NewWriterSize(diskWriter, 256*1024)
-		written, err := io.CopyBuffer(bufWriter, tr, buf)
-		flushErr := bufWriter.Flush()
-		_ = outFile.Close()
-		manager.ClearActiveFile()
-		if err == nil && flushErr != nil {
-			err = flushErr
-		}
+		written, err := writeEntryToFile(ctx, outFile, actualOutputDir, midStreamMinMB, header.Size, tr, buf)
 		manager.ClearActiveFile()
 
 		if err != nil {
@@ -1141,16 +1451,9 @@ func extractZIP(ctx context.Context, client *http.Client, resolvedURL string, co
 			s.FinalDest = actualOutputDir
 		})
 
-		diskWriter := newDiskCheckingWriter(outFile, actualOutputDir, midStreamMinMB)
-		bufWriter := bufio.NewWriterSize(diskWriter, 256*1024)
-		written, err := io.CopyBuffer(bufWriter, bufferedRC, buf)
-		flushErr := bufWriter.Flush()
+		written, err := writeEntryToFile(ctx, outFile, actualOutputDir, midStreamMinMB, int64(file.UncompressedSize64), bufferedRC, buf)
 		_ = rc.Close()
-		_ = outFile.Close()
 		manager.ClearActiveFile()
-		if err == nil && flushErr != nil {
-			err = flushErr
-		}
 
 		if err != nil {
 			_ = os.Remove(targetPath)
@@ -1362,16 +1665,9 @@ func extract7Z(ctx context.Context, client *http.Client, resolvedURL string, con
 			s.FinalDest = actualOutputDir
 		})
 
-		diskWriter := newDiskCheckingWriter(outFile, actualOutputDir, midStreamMinMB)
-		bufWriter := bufio.NewWriterSize(diskWriter, 256*1024)
-		written, err := io.CopyBuffer(bufWriter, rc, buf)
-		flushErr := bufWriter.Flush()
+		written, err := writeEntryToFile(ctx, outFile, actualOutputDir, midStreamMinMB, int64(file.UncompressedSize), rc, buf)
 		_ = rc.Close()
-		_ = outFile.Close()
 		manager.ClearActiveFile()
-		if err == nil && flushErr != nil {
-			err = flushErr
-		}
 
 		if err != nil {
 			_ = os.Remove(targetPath)

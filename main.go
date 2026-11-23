@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	appVersion       = "v1.0.1"
+	appVersion       = "v1.1.0"
 	defaultUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	defaultBufferMB  = 4
 	maxRetries       = 10
@@ -785,6 +785,42 @@ func getSettingsFilePath() string {
 	return filepath.Join(getAppConfigDir(), "settings.json")
 }
 
+func maxParallelConnsForOS(goos string) int {
+	if goos == "android" {
+		return 8
+	}
+	return 16
+}
+
+func maxBufferMBForOS(goos string) int {
+	if goos == "android" {
+		return 64
+	}
+	return 512
+}
+
+func normalizeParallelConnsForOS(goos string, workers int) int {
+	if workers <= 0 {
+		return 4
+	}
+	maxW := maxParallelConnsForOS(goos)
+	if workers > maxW {
+		return maxW
+	}
+	return workers
+}
+
+func normalizeBufferMBForOS(goos string, bufferMB int) int {
+	if bufferMB <= 0 {
+		return defaultBufferMB
+	}
+	maxB := maxBufferMBForOS(goos)
+	if bufferMB > maxB {
+		return maxB
+	}
+	return bufferMB
+}
+
 func defaultAppSettings() AppSettings {
 	return AppSettings{
 		DefaultDest:       getDefaultDownloadsDir(),
@@ -822,12 +858,8 @@ func loadSettings() AppSettings {
 		log.Printf("[SETTINGS:WARN] Corrupted settings JSON in %s (%v); backed up to %s, using defaults", path, err, bakPath)
 		return defaultAppSettings()
 	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = 4
-	}
-	if cfg.BufferMB <= 0 {
-		cfg.BufferMB = defaultBufferMB
-	}
+	cfg.Workers = normalizeParallelConnsForOS(runtime.GOOS, cfg.Workers)
+	cfg.BufferMB = normalizeBufferMBForOS(runtime.GOOS, cfg.BufferMB)
 	if cfg.ConflictMode == "" {
 		cfg.ConflictMode = "ask"
 	}
@@ -844,12 +876,8 @@ func saveSettings(cfg AppSettings) error {
 	if cfg.DefaultDest == "" {
 		cfg.DefaultDest = getDefaultDownloadsDir()
 	}
-	if cfg.Workers <= 0 {
-		cfg.Workers = 4
-	}
-	if cfg.BufferMB <= 0 {
-		cfg.BufferMB = defaultBufferMB
-	}
+	cfg.Workers = normalizeParallelConnsForOS(runtime.GOOS, cfg.Workers)
+	cfg.BufferMB = normalizeBufferMBForOS(runtime.GOOS, cfg.BufferMB)
 	if cfg.ConflictMode == "" {
 		cfg.ConflictMode = "ask"
 	}
@@ -1033,12 +1061,8 @@ func executeTask(opts TaskOptions) {
 	}()
 	manager.cancelIdleTimer()
 
-	if opts.BufferSizeMB <= 0 {
-		opts.BufferSizeMB = defaultBufferMB
-	}
-	if opts.ParallelConns <= 0 {
-		opts.ParallelConns = 4
-	}
+	opts.BufferSizeMB = normalizeBufferMBForOS(runtime.GOOS, opts.BufferSizeMB)
+	opts.ParallelConns = normalizeParallelConnsForOS(runtime.GOOS, opts.ParallelConns)
 	if opts.ConflictPolicy == "" {
 		opts.ConflictPolicy = "merge"
 	}
@@ -1353,8 +1377,8 @@ func executeTask(opts TaskOptions) {
 
 	switch archiveType {
 	case ArchiveRAR5, ArchiveTar, ArchiveTarGz, ArchiveTarZst:
-		streamClient := createStreamingHTTPClient(0)
-		multiReader := NewMultiPartStreamReader(ctx, streamClient, urls, opts.ParallelConns, opts.Headers, telemetryCallback)
+		streamClient := createStreamingHTTPClientWithWorkers(0, opts.ParallelConns)
+		multiReader := NewMultiPartStreamReaderWithBuffer(ctx, streamClient, urls, opts.ParallelConns, opts.BufferSizeMB, opts.Headers, telemetryCallback)
 		defer multiReader.Close()
 
 		if archiveType == ArchiveRAR5 {
@@ -1368,13 +1392,13 @@ func executeTask(opts TaskOptions) {
 		}
 
 	case ArchiveZIP:
-		rangeClient := createOptimizedHTTPClient(30 * time.Second)
+		rangeClient := buildHTTPClientWithWorkers(30*time.Second, false, opts.ParallelConns)
 		extractedCount, skippedCount, totalUncompressedBytes, finalExtractedDir, extractionErr = extractZIP(
 			ctx, rangeClient, resolvedURL, contentLength, opts.Dest, opts.AutoSubfolder, opts.CustomFolder, opts.ConflictPolicy, fallbackFolderName, opts.BufferSizeMB, excludePatterns, selectionSet, opts.Headers,
 		)
 
 	case Archive7Z:
-		rangeClient := createOptimizedHTTPClient(30 * time.Second)
+		rangeClient := buildHTTPClientWithWorkers(30*time.Second, false, opts.ParallelConns)
 		extractedCount, skippedCount, totalUncompressedBytes, finalExtractedDir, extractionErr = extract7Z(
 			ctx, rangeClient, resolvedURL, contentLength, opts.Dest, opts.AutoSubfolder, opts.CustomFolder, opts.ConflictPolicy, fallbackFolderName, opts.Password, opts.BufferSizeMB, excludePatterns, selectionSet, opts.Headers,
 		)
@@ -1585,15 +1609,17 @@ func handleDefaults(w http.ResponseWriter, r *http.Request) {
 	home, _ := os.UserHomeDir()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"default_dest": getDefaultDownloadsDir(),
-		"home_dir":     home,
-		"os":           runtime.GOOS,
-		"arch":         runtime.GOARCH,
-		"is_android":   runtime.GOOS == "android",
-		"version":      appVersion,
-		"log_path":     getLogFilePath(),
-		"lan_urls":     getLANURLs(activeServerPort),
-		"settings":     loadSettings(),
+		"default_dest":  getDefaultDownloadsDir(),
+		"home_dir":      home,
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"is_android":    runtime.GOOS == "android",
+		"max_workers":   maxParallelConnsForOS(runtime.GOOS),
+		"max_buffer_mb": maxBufferMBForOS(runtime.GOOS),
+		"version":       appVersion,
+		"log_path":      getLogFilePath(),
+		"lan_urls":      getLANURLs(activeServerPort),
+		"settings":      loadSettings(),
 	})
 }
 
@@ -1619,12 +1645,8 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 		if cfg.DefaultDest == "" {
 			cfg.DefaultDest = getDefaultDownloadsDir()
 		}
-		if cfg.Workers <= 0 {
-			cfg.Workers = 4
-		}
-		if cfg.BufferMB <= 0 {
-			cfg.BufferMB = defaultBufferMB
-		}
+		cfg.Workers = normalizeParallelConnsForOS(runtime.GOOS, cfg.Workers)
+		cfg.BufferMB = normalizeBufferMBForOS(runtime.GOOS, cfg.BufferMB)
 		if cfg.ConflictMode == "" {
 			cfg.ConflictMode = "merge"
 		}

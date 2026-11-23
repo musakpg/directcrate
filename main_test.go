@@ -9,12 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1992,9 +1995,9 @@ func TestCheckUpdateAPI(t *testing.T) {
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"tag_name": "v1.1.0",
-			"html_url": "https://github.com/musakpg/directcrate/releases/tag/v1.1.0",
-			"body":     "What's new in v1.1.0: performance boosts.",
+			"tag_name": "v1.2.0",
+			"html_url": "https://github.com/musakpg/directcrate/releases/tag/v1.2.0",
+			"body":     "What's new in v1.2.0: performance boosts.",
 		})
 	}))
 	defer mockServer.Close()
@@ -2016,12 +2019,12 @@ func TestCheckUpdateAPI(t *testing.T) {
 	}
 
 	if !resp.UpdateAvailable {
-		t.Fatalf("expected update_available=true for v1.1.0 > %s", appVersion)
+		t.Fatalf("expected update_available=true for v1.2.0 > %s", appVersion)
 	}
-	if resp.LatestVersion != "v1.1.0" {
-		t.Fatalf("expected latest_version=v1.1.0, got %s", resp.LatestVersion)
+	if resp.LatestVersion != "v1.2.0" {
+		t.Fatalf("expected latest_version=v1.2.0, got %s", resp.LatestVersion)
 	}
-	if resp.ReleaseURL != "https://github.com/musakpg/directcrate/releases/tag/v1.1.0" {
+	if resp.ReleaseURL != "https://github.com/musakpg/directcrate/releases/tag/v1.2.0" {
 		t.Fatalf("unexpected release_url: %s", resp.ReleaseURL)
 	}
 
@@ -2257,6 +2260,628 @@ func TestSecurityPathTraversalAndSymlinks(t *testing.T) {
 		t.Fatalf("expected mid-stream storage halt error message, got %v", err)
 	}
 }
+
+func TestDedicatedHTTP11TransportConfiguration(t *testing.T) {
+	workersList := []int{1, 4, 8, 16}
+	for _, w := range workersList {
+		tr := buildStreamingTransport(w)
+		if tr.ForceAttemptHTTP2 {
+			t.Fatalf("expected ForceAttemptHTTP2=false for workers=%d, got true", w)
+		}
+		if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+			t.Fatalf("expected non-nil empty TLSNextProto map to disable HTTP/2 for workers=%d", w)
+		}
+		expectedPool := w * 2
+		if tr.MaxIdleConns != expectedPool {
+			t.Fatalf("expected MaxIdleConns=%d, got %d", expectedPool, tr.MaxIdleConns)
+		}
+		if tr.MaxIdleConnsPerHost != expectedPool {
+			t.Fatalf("expected MaxIdleConnsPerHost=%d, got %d", expectedPool, tr.MaxIdleConnsPerHost)
+		}
+		if tr.MaxConnsPerHost != expectedPool {
+			t.Fatalf("expected MaxConnsPerHost=%d, got %d", expectedPool, tr.MaxConnsPerHost)
+		}
+		if tr.IdleConnTimeout != 90*time.Second {
+			t.Fatalf("expected IdleConnTimeout=90s, got %v", tr.IdleConnTimeout)
+		}
+		if tr.ReadBufferSize != 256*1024 {
+			t.Fatalf("expected ReadBufferSize=256KB, got %d", tr.ReadBufferSize)
+		}
+		if tr.WriteBufferSize != 64*1024 {
+			t.Fatalf("expected WriteBufferSize=64KB, got %d", tr.WriteBufferSize)
+		}
+		if !tr.DisableCompression {
+			t.Fatalf("expected DisableCompression=true")
+		}
+	}
+}
+
+func TestPlatformAwareSettingsValidationAndPrefetchWindow(t *testing.T) {
+	// 1. Parallel HTTP Connections limits
+	if got := normalizeParallelConnsForOS("linux", 16); got != 16 {
+		t.Fatalf("expected linux to allow 16 workers, got %d", got)
+	}
+	if got := normalizeParallelConnsForOS("windows", 24); got != 16 {
+		t.Fatalf("expected windows to cap workers at 16, got %d", got)
+	}
+	if got := normalizeParallelConnsForOS("darwin", 12); got != 12 {
+		t.Fatalf("expected darwin to allow 12 workers, got %d", got)
+	}
+	if got := normalizeParallelConnsForOS("android", 16); got != 8 {
+		t.Fatalf("expected android to cap workers at 8, got %d", got)
+	}
+	if got := normalizeParallelConnsForOS("android", 0); got != 4 {
+		t.Fatalf("expected default 4 workers when <=0, got %d", got)
+	}
+
+	// 2. I/O Stream Buffer Size limits
+	if got := normalizeBufferMBForOS("linux", 512); got != 512 {
+		t.Fatalf("expected linux to allow 512 MB buffer, got %d", got)
+	}
+	if got := normalizeBufferMBForOS("windows", 1024); got != 512 {
+		t.Fatalf("expected windows to cap buffer at 512 MB, got %d", got)
+	}
+	if got := normalizeBufferMBForOS("android", 256); got != 64 {
+		t.Fatalf("expected android to cap buffer at 64 MB, got %d", got)
+	}
+	if got := normalizeBufferMBForOS("linux", -1); got != defaultBufferMB {
+		t.Fatalf("expected defaultBufferMB (%d) when <=0, got %d", defaultBufferMB, got)
+	}
+
+	// 3. Sliding-Window Prefetch Buffer capacity calculation
+	desktopDefaultWin := computePrefetchWindowChunks("linux", 4, chunkSize2MB, 4)
+	if desktopDefaultWin < 24 || desktopDefaultWin > 32 {
+		t.Fatalf("expected desktop default window in [24, 32], got %d", desktopDefaultWin)
+	}
+	desktop256Win := computePrefetchWindowChunks("linux", 256, chunkSize4MB, 8)
+	if desktop256Win != 64 {
+		t.Fatalf("expected 256MB / 4MB = 64 chunks on desktop, got %d", desktop256Win)
+	}
+	desktop512Win := computePrefetchWindowChunks("windows", 512, chunkSize4MB, 16)
+	if desktop512Win != 128 {
+		t.Fatalf("expected 512MB / 4MB = 128 chunks on desktop, got %d", desktop512Win)
+	}
+	androidDefaultWin := computePrefetchWindowChunks("android", 4, chunkSize2MB, 4)
+	if androidDefaultWin < 4 || androidDefaultWin > 6 {
+		t.Fatalf("expected android default window in [4, 6], got %d", androidDefaultWin)
+	}
+	androidCappedWin := computePrefetchWindowChunks("android", 512, chunkSize4MB, 8)
+	if androidCappedWin != 16 {
+		t.Fatalf("expected android 512MB setting capped at 64MB / 4MB = 16 chunks, got %d", androidCappedWin)
+	}
+}
+
+func TestAdaptiveChunkSizingAndPoolReuse(t *testing.T) {
+	// 1. Desktop ramp-up: 2MB -> 4MB -> 8MB above 25 MB/s, step-down on stalls
+	sz := int64(chunkSize2MB)
+	sz = nextAdaptiveChunkSize("linux", sz, 10.0, 0)
+	if sz != chunkSize2MB {
+		t.Fatalf("expected 2MB below 25 MB/s, got %d", sz)
+	}
+	sz = nextAdaptiveChunkSize("linux", sz, 30.0, 0)
+	if sz != chunkSize4MB {
+		t.Fatalf("expected ramp up to 4MB above 25 MB/s, got %d", sz)
+	}
+	sz = nextAdaptiveChunkSize("linux", sz, 45.0, 0)
+	if sz != chunkSize8MB {
+		t.Fatalf("expected ramp up to 8MB on desktop sustained high speed, got %d", sz)
+	}
+	// Step down when recent hedges >= 2
+	sz = nextAdaptiveChunkSize("linux", sz, 45.0, 2)
+	if sz != chunkSize4MB {
+		t.Fatalf("expected step down from 8MB to 4MB on frequent stalls, got %d", sz)
+	}
+	sz = nextAdaptiveChunkSize("linux", sz, 45.0, 2)
+	if sz != chunkSize2MB {
+		t.Fatalf("expected step down from 4MB to 2MB on frequent stalls, got %d", sz)
+	}
+
+	// 2. Android conservative cap (2MB - 4MB max)
+	androidSz := int64(chunkSize2MB)
+	androidSz = nextAdaptiveChunkSize("android", androidSz, 60.0, 0)
+	if androidSz != chunkSize4MB {
+		t.Fatalf("expected android ramp to 4MB, got %d", androidSz)
+	}
+	androidSz = nextAdaptiveChunkSize("android", androidSz, 80.0, 0)
+	if androidSz != chunkSize4MB {
+		t.Fatalf("expected android capped at 4MB max, got %d", androidSz)
+	}
+
+	// 3. Chunk buffer pool reuse
+	b1 := acquireChunkBuffer(1500 * 1024)
+	if len(b1) != 1500*1024 || cap(b1) != chunkSize2MB {
+		t.Fatalf("unexpected pooled chunk buffer len=%d cap=%d", len(b1), cap(b1))
+	}
+	releaseChunkBuffer(b1)
+}
+
+func TestParallelRangeStreamHedgedSlowChunkRecovery(t *testing.T) {
+	// Create deterministic 384KB payload split into three 128KB chunks
+	const testChunkSz = 128 * 1024
+	const totalSz = testChunkSz * 3
+	payload := make([]byte, totalSz)
+	for i := range payload {
+		payload[i] = byte((i * 31) % 251)
+	}
+
+	var chunk0Requests atomic.Int32
+	var primaryCanceled atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		if _, err := fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		if end >= int64(len(payload)) {
+			end = int64(len(payload)) - 1
+		}
+
+		// Simulate head-of-line stall on the first attempt for chunk 0 (start == 0)
+		if start == 0 {
+			attemptNum := chunk0Requests.Add(1)
+			if attemptNum == 1 {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+				w.WriteHeader(http.StatusPartialContent)
+				// Write 1KB then stall until the hedged backup finishes and cancels this request
+				_, _ = w.Write(payload[start : start+1024])
+				if fl, ok := w.(http.Flusher); ok {
+					fl.Flush()
+				}
+				select {
+				case <-r.Context().Done():
+					primaryCanceled.Store(true)
+					return
+				case <-time.After(3 * time.Second):
+					return
+				}
+			}
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	prs := &ParallelRangeStream{
+		ctx:                streamCtx,
+		cancel:             streamCancel,
+		client:             createStreamingHTTPClientWithWorkers(5*time.Second, 3),
+		url:                srv.URL,
+		totalSize:          totalSz,
+		workers:            3,
+		bufferSizeMB:       16,
+		goos:               "linux",
+		chunkSize:          testChunkSz,
+		chunks:             make(map[int64][]byte),
+		inflight:           make(map[int64]*inflightChunkState),
+		speedCalc:          newRollingSpeedCalculator(),
+		hedgeStallTimeout:  80 * time.Millisecond,
+		hedgeMinElapsed:    50 * time.Millisecond,
+		hedgeCheckInterval: 20 * time.Millisecond,
+		hedgeLowSpeedBps:   200 * 1024,
+		hedgeBackoffDur:    1 * time.Second,
+	}
+	prs.cond = sync.NewCond(&prs.mu)
+
+	// Override initial chunk size to testChunkSz by pre-setting scheduledChunks
+	prs.scheduledChunks = int64(prs.workers)
+	prs.startWorkers()
+	defer prs.Close()
+
+	got, err := io.ReadAll(prs)
+	if err != nil {
+		t.Fatalf("ReadAll from ParallelRangeStream failed: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("hedged stream payload mismatch: got %d bytes, want %d bytes", len(got), len(payload))
+	}
+	if prs.hedgeCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 hedged request for stalled head chunk, got %d", prs.hedgeCount.Load())
+	}
+	if chunk0Requests.Load() != 2 {
+		t.Fatalf("expected 2 requests for chunk 0 (primary + 1 hedge), got %d", chunk0Requests.Load())
+	}
+
+	// Verify slower primary request was canceled promptly
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for !primaryCanceled.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !primaryCanceled.Load() {
+		t.Fatalf("expected stalled primary request context to be canceled immediately after hedge succeeded")
+	}
+}
+
+func TestParallelRangeStreamHedgeBackoffOn429(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prs := &ParallelRangeStream{
+		ctx:             ctx,
+		cancel:          cancel,
+		goos:            "linux",
+		chunkSize:       chunkSize8MB,
+		hedgeBackoffDur: 5 * time.Second,
+		chunks:          make(map[int64][]byte),
+		inflight:        make(map[int64]*inflightChunkState),
+	}
+	prs.cond = sync.NewCond(&prs.mu)
+
+	prs.recordRateLimitBackoff()
+
+	prs.mu.Lock()
+	inBackoff := time.Now().Before(prs.hedgeBackoffUntil)
+	newChunkSz := prs.chunkSize
+	prs.mu.Unlock()
+
+	if !inBackoff {
+		t.Fatalf("expected hedgeBackoffUntil to be in the future after 429/503 backoff")
+	}
+	if newChunkSz >= chunkSize8MB {
+		t.Fatalf("expected chunkSize to step down on rate-limit backoff, got %d", newChunkSz)
+	}
+}
+
+func TestParallelRangeStreamHealthy16StreamZeroFalseHedges(t *testing.T) {
+	// 1. Live 16-stream download where each stream transfers at ~1/16th (6.25%) of total throughput
+	// and chunks remain in-flight past hedgeMinElapsed before completing.
+	const numWorkers = 16
+	const testChunkSz = 64 * 1024
+	const numChunks = 32
+	const totalSz = testChunkSz * numChunks
+
+	payload := make([]byte, totalSz)
+	for i := range payload {
+		payload[i] = byte((i * 37) % 253)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		if _, err := fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end); err != nil {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		if end >= int64(len(payload)) {
+			end = int64(len(payload)) - 1
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.WriteHeader(http.StatusPartialContent)
+
+		// Stream each 64KB chunk in four 16KB steps over ~60ms (> hedgeMinElapsed of 30ms)
+		// so all 16 streams share aggregate throughput equally (1/16th per stream).
+		step := int64(16 * 1024)
+		for pos := start; pos <= end; pos += step {
+			sliceEnd := pos + step
+			if sliceEnd > end+1 {
+				sliceEnd = end + 1
+			}
+			_, _ = w.Write(payload[pos:sliceEnd])
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	prs := &ParallelRangeStream{
+		ctx:                streamCtx,
+		cancel:             streamCancel,
+		client:             createStreamingHTTPClientWithWorkers(5*time.Second, numWorkers),
+		url:                srv.URL,
+		totalSize:          totalSz,
+		workers:            numWorkers,
+		bufferSizeMB:       32,
+		goos:               "linux",
+		chunkSize:          testChunkSz,
+		chunks:             make(map[int64][]byte),
+		inflight:           make(map[int64]*inflightChunkState),
+		speedCalc:          newRollingSpeedCalculator(),
+		hedgeStallTimeout:  500 * time.Millisecond,
+		hedgeMinElapsed:    30 * time.Millisecond,
+		hedgeCheckInterval: 10 * time.Millisecond,
+		hedgeLowSpeedBps:   defaultHedgeLowSpeedBps,
+		hedgeBackoffDur:    1 * time.Second,
+		hedgeCooldown:      50 * time.Millisecond,
+		hedgeWindowDur:     1 * time.Second,
+		maxHedgesPerWindow: 2,
+	}
+	prs.cond = sync.NewCond(&prs.mu)
+	prs.scheduledChunks = int64(prs.workers)
+	prs.startWorkers()
+	defer prs.Close()
+
+	got, err := io.ReadAll(prs)
+	if err != nil {
+		t.Fatalf("ReadAll on 16-stream download failed: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("16-stream payload mismatch: got %d bytes, want %d bytes", len(got), len(payload))
+	}
+	if prs.hedgeCount.Load() != 0 {
+		t.Fatalf("expected 0 false hedges on healthy 16-stream download, got %d", prs.hedgeCount.Load())
+	}
+
+	// 2. Deterministic checkAndTriggerHeadHedge math verification for 16-stream downloads:
+	// Case A: 16 streams at 16 MB/s aggregate (each stream = 1 MB/s = 6.25% of aggregate, 100% of perStreamAvg).
+	// Case B: 16 streams on a slow/throttled link at 1.6 MB/s aggregate (each stream = 100 KB/s < 150 KB/s,
+	//         still 100% of perStreamAvg, so NOT < 20% of perStreamAvg).
+	t0 := time.Now()
+	for _, tc := range []struct {
+		name              string
+		aggregateSpeedMBs float64
+		streamBps         int64
+	}{
+		{name: "16-stream high speed 1MB/s per stream", aggregateSpeedMBs: 16.0, streamBps: 1024 * 1024},
+		{name: "16-stream slow server 100KB/s per stream", aggregateSpeedMBs: 1.6, streamBps: 100 * 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ic := &inflightChunkState{
+				id:             0,
+				start:          0,
+				end:            chunkSize8MB - 1,
+				startedAt:      t0,
+				hedgeTriggerCh: make(chan struct{}, 1),
+			}
+			// Simulate 5 seconds of active in-flight transfer at streamBps
+			now := t0.Add(5 * time.Second)
+			ic.bytesRead.Store(tc.streamBps * 5)
+			ic.lastProgressUnixNano.Store(now.Add(-50 * time.Millisecond).UnixNano())
+
+			sim := &ParallelRangeStream{
+				goos:               "linux",
+				workers:            16,
+				chunkSize:          chunkSize8MB,
+				nextReadID:         0,
+				headWaitChunkID:    0,
+				headWaitSince:      t0, // Reader blocked waiting for 5s (>= 4s grace period)
+				sustainedSpeedMBs:  tc.aggregateSpeedMBs,
+				chunks:             make(map[int64][]byte),
+				inflight:           map[int64]*inflightChunkState{0: ic},
+				hedgeStallTimeout:  defaultHedgeStallTimeout,
+				hedgeMinElapsed:    defaultHedgeMinElapsed,
+				hedgeLowSpeedBps:   defaultHedgeLowSpeedBps,
+				hedgeBackoffDur:    defaultHedgeBackoffDur,
+				hedgeCooldown:      defaultHedgeCooldown,
+				hedgeWindowDur:     defaultHedgeWindowDur,
+				maxHedgesPerWindow: defaultMaxHedgesPerWindow,
+			}
+			sim.completedChunks.Store(4)
+
+			sim.checkAndTriggerHeadHedge(now)
+
+			if ic.hedged.Load() {
+				t.Fatalf("expected zero false hedges for %s, but head chunk was hedged", tc.name)
+			}
+			if sim.chunkSize != chunkSize8MB {
+				t.Fatalf("expected adaptive chunkSize to remain 8MB during healthy/slow-server 16-stream download, got %d", sim.chunkSize)
+			}
+		})
+	}
+}
+
+func TestParallelRangeStreamHedgeGracePeriodCooldownAndBackoff(t *testing.T) {
+	t0 := time.Now()
+
+	// 1. Grace period: when nextReadID just advanced (reader waited only 1s < 4s),
+	// even an already in-flight 5s-old degraded chunk (20 KB/s vs 1 MB/s perStreamAvg) must NOT be hedged.
+	icHead := &inflightChunkState{
+		id:             5,
+		start:          5 * chunkSize4MB,
+		end:            6*chunkSize4MB - 1,
+		startedAt:      t0,
+		hedgeTriggerCh: make(chan struct{}, 1),
+	}
+	nowAt5s := t0.Add(5 * time.Second)
+	icHead.bytesRead.Store(20 * 1024 * 5) // 20 KB/s (< 20% of 1 MB/s perStreamAvg AND < 150 KB/s)
+	icHead.lastProgressUnixNano.Store(nowAt5s.Add(-100 * time.Millisecond).UnixNano())
+
+	prs := &ParallelRangeStream{
+		goos:               "linux",
+		workers:            16,
+		chunkSize:          chunkSize8MB,
+		nextReadID:         5,
+		headWaitChunkID:    5,
+		headWaitSince:      nowAt5s.Add(-1 * time.Second), // Reader only blocked for 1s (< 4s minimum head-wait)
+		sustainedSpeedMBs:  16.0,                          // 1.0 MB/s per stream across 16 workers
+		chunks:             make(map[int64][]byte),
+		inflight:           map[int64]*inflightChunkState{5: icHead},
+		hedgeStallTimeout:  defaultHedgeStallTimeout,
+		hedgeMinElapsed:    defaultHedgeMinElapsed,
+		hedgeLowSpeedBps:   defaultHedgeLowSpeedBps,
+		hedgeBackoffDur:    defaultHedgeBackoffDur,
+		hedgeCooldown:      defaultHedgeCooldown,
+		hedgeWindowDur:     defaultHedgeWindowDur,
+		maxHedgesPerWindow: defaultMaxHedgesPerWindow,
+	}
+	prs.completedChunks.Store(5)
+
+	prs.checkAndTriggerHeadHedge(nowAt5s)
+	if icHead.hedged.Load() {
+		t.Fatalf("expected no hedge when reader has only waited 1s (< 4s head-wait grace period)")
+	}
+
+	// 2. Once reader has waited >= 4s on head chunk 5, degraded rate (< 20% perStreamAvg AND < 150 KB/s) triggers hedge #1,
+	// without stepping down adaptive chunkSize (since it is not a genuine 6s zero-progress stall).
+	prs.headWaitSince = t0 // Reader has now waited 5s (>= 4s)
+	prs.checkAndTriggerHeadHedge(nowAt5s)
+	if !icHead.hedged.Load() {
+		t.Fatalf("expected degraded head chunk to be hedged after 5s head-wait")
+	}
+	if prs.chunkSize != chunkSize8MB {
+		t.Fatalf("expected chunkSize to stay at 8MB on non-stall degraded rate hedge, got %d", prs.chunkSize)
+	}
+
+	// 3. Global 3-second cooldown prevents a second hedge from firing 1 second later on chunk 6.
+	icNext := &inflightChunkState{
+		id:             6,
+		start:          6 * chunkSize4MB,
+		end:            7*chunkSize4MB - 1,
+		startedAt:      t0,
+		hedgeTriggerCh: make(chan struct{}, 1),
+	}
+	nowAt6s := t0.Add(6 * time.Second)
+	icNext.bytesRead.Store(0)
+	icNext.lastProgressUnixNano.Store(t0.UnixNano()) // Stalled for 6s
+	prs.nextReadID = 6
+	prs.headWaitChunkID = 6
+	prs.headWaitSince = t0
+	prs.inflight[6] = icNext
+
+	prs.checkAndTriggerHeadHedge(nowAt6s) // Only 1s after hedge #1 at t0+5s (< 3s cooldown)
+	if icNext.hedged.Load() {
+		t.Fatalf("expected global 3s cooldown to prevent consecutive hedge 1s after previous hedge")
+	}
+
+	// 4. After 3s cooldown expires (at t0+8.5s), hedge #2 fires; because speed did not improve (still 16.0 MB/s),
+	// automatic temporary backoff engages for hedgeBackoffDur (30s).
+	nowAt8_5s := t0.Add(8500 * time.Millisecond)
+	prs.checkAndTriggerHeadHedge(nowAt8_5s)
+	if !icNext.hedged.Load() {
+		t.Fatalf("expected hedge #2 to fire after 3s global cooldown elapsed")
+	}
+	if !nowAt8_5s.Before(prs.hedgeBackoffUntil) {
+		t.Fatalf("expected automatic temporary hedge backoff to engage after repeated hedges without speed improvement")
+	}
+
+	// 5. While in automatic temporary backoff, a 3rd stalled chunk at t0+13s is not hedged.
+	icThird := &inflightChunkState{
+		id:             7,
+		start:          7 * chunkSize4MB,
+		end:            8*chunkSize4MB - 1,
+		startedAt:      t0,
+		hedgeTriggerCh: make(chan struct{}, 1),
+	}
+	icThird.lastProgressUnixNano.Store(t0.UnixNano())
+	prs.nextReadID = 7
+	prs.headWaitChunkID = 7
+	prs.headWaitSince = t0
+	prs.inflight[7] = icThird
+
+	prs.checkAndTriggerHeadHedge(t0.Add(13 * time.Second))
+	if icThird.hedged.Load() {
+		t.Fatalf("expected hedge to be suppressed during automatic temporary backoff")
+	}
+}
+
+type failingWriter struct {
+	failAfter int
+	written   int
+	err       error
+}
+
+func (fw *failingWriter) Write(p []byte) (int, error) {
+	if fw.written+len(p) > fw.failAfter {
+		n := fw.failAfter - fw.written
+		if n < 0 {
+			n = 0
+		}
+		fw.written += n
+		return n, fw.err
+	}
+	fw.written += len(p)
+	return len(p), nil
+}
+
+func TestAsyncBufferedWriterConcurrencyErrorAndAbort(t *testing.T) {
+	// 1. Concurrent multi-buffer write & deterministic flush
+	var outBuf bytes.Buffer
+	ctx := context.Background()
+	aw := newAsyncBufferedWriterWithSize(ctx, &outBuf, 64*1024)
+
+	expected := bytes.Repeat([]byte("DirectCrate-Async-Disk-Writer-Test-Payload-"), 6000)
+	// Write in uneven chunk sizes to exercise double-buffer transitions
+	offset := 0
+	step := 17 * 1024
+	for offset < len(expected) {
+		end := offset + step
+		if end > len(expected) {
+			end = len(expected)
+		}
+		n, err := aw.Write(expected[offset:end])
+		if err != nil {
+			t.Fatalf("unexpected write error: %v", err)
+		}
+		if n != end-offset {
+			t.Fatalf("short write: got %d, want %d", n, end-offset)
+		}
+		offset = end
+	}
+	if err := aw.Close(); err != nil {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+	if !bytes.Equal(outBuf.Bytes(), expected) {
+		t.Fatalf("asyncBufferedWriter output mismatch: got %d bytes, want %d bytes", outBuf.Len(), len(expected))
+	}
+
+	// 2. Deterministic error propagation from background writer goroutine
+	fw := &failingWriter{
+		failAfter: 32 * 1024,
+		err:       syscall.ENOSPC,
+	}
+	awErr := newAsyncBufferedWriterWithSize(context.Background(), fw, 16*1024)
+	var writeOrCloseErr error
+	for i := 0; i < 10; i++ {
+		if _, err := awErr.Write(bytes.Repeat([]byte("X"), 16*1024)); err != nil {
+			writeOrCloseErr = err
+			break
+		}
+	}
+	closeErr := awErr.Close()
+	if writeOrCloseErr == nil {
+		writeOrCloseErr = closeErr
+	}
+	if !errors.Is(writeOrCloseErr, syscall.ENOSPC) {
+		t.Fatalf("expected syscall.ENOSPC propagated from asyncBufferedWriter, got %v", writeOrCloseErr)
+	}
+
+	// 3. Immediate Abort cancellation propagation
+	abortCtx, abortCancel := context.WithCancel(context.Background())
+	var abortBuf bytes.Buffer
+	awAbort := newAsyncBufferedWriterWithSize(abortCtx, &abortBuf, 32*1024)
+	_, _ = awAbort.Write([]byte("initial bytes"))
+	abortCancel()
+	_, errAfterCancel := awAbort.Write(bytes.Repeat([]byte("Y"), 64*1024))
+	closeAbortErr := awAbort.Close()
+	if errAfterCancel == nil && closeAbortErr == nil {
+		t.Fatalf("expected error on Write/Close after context abort")
+	}
+
+	// 4. writeEntryToFile with pre-allocation
+	tmpDir := t.TempDir()
+	targetPath := filepath.Join(tmpDir, "prealloc_test.bin")
+	f, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		t.Fatalf("failed creating temp file: %v", err)
+	}
+	copyBuf := make([]byte, 32*1024)
+	fileData := bytes.Repeat([]byte("PREALLOCATED_BLOCK_DATA_"), 4096)
+	written, err := writeEntryToFile(context.Background(), f, tmpDir, 1, int64(len(fileData)), bytes.NewReader(fileData), copyBuf)
+	if err != nil {
+		t.Fatalf("writeEntryToFile failed: %v", err)
+	}
+	if written != int64(len(fileData)) {
+		t.Fatalf("expected written=%d, got %d", len(fileData), written)
+	}
+	readBack, err := os.ReadFile(targetPath)
+	if err != nil || !bytes.Equal(readBack, fileData) {
+		t.Fatalf("file content mismatch after writeEntryToFile")
+	}
+}
+
 
 
 

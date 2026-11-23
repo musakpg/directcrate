@@ -52,7 +52,10 @@ DirectCrate solves this by decompressing byte streams in memory on the fly:
 │                        Remote HTTP(S) Server                           │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
-                                    ├──► ParallelRangeStream (2 MB chunks across 1–8 workers)
+                                    ├──► ParallelRangeStream (Dedicated HTTP/1.1 sockets, 1–16 Desktop / 1–8 Android)
+                                    │    ├── Adaptive Chunk Sizing (2 MB TTFB → 4 MB – 8 MB above 25 MB/s)
+                                    │    ├── Continuous Sliding-Window Prefetch (24–32+ chunks / up to 512 MB RAM)
+                                    │    └── Head-of-Line Hedged Request Recovery (Slow-chunk backup & 429 backoff)
                                     ├──► ResilientSingleStream (Automatic HTTP Range resume)
                                     └──► MultiPartStreamReader (Sequential part1 → part2 → ... → partN)
                                     │
@@ -64,8 +67,14 @@ DirectCrate solves this by decompressing byte streams in memory on the fly:
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                    Configurable sync.Pool I/O Buffer                   │
-│                       (1 MB, 2 MB, 4 MB, 8 MB, 16 MB)                  │
+│              Configurable sync.Pool Sliding-Window Buffer              │
+│          (Desktop: 1 MB – 512 MB • Android: 1 MB – 64 MB cap)          │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│          Double-Buffered Async Disk Writer & Pre-Allocation            │
+│    (Concurrent 4 MB Desktop / 512 KB Android bufio + Linux fallocate)  │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
                                     ▼
@@ -77,7 +86,11 @@ DirectCrate solves this by decompressing byte streams in memory on the fly:
 
 ### Key Capabilities
 
-- **Parallel HTTP Range Prefetching**: Splits downloads into `2 MB` segments across 1–8 concurrent workers when remote servers support `Accept-Ranges: bytes`.
+- **Dedicated HTTP/1.1 Multi-Socket Streaming Engine**: Disables HTTP/2 single-connection multiplexing on archive streams (`ForceAttemptHTTP2: false`, empty `TLSNextProto`) so each parallel worker operates over its own dedicated TCP socket. Scales connection pooling dynamically with worker count (`MaxIdleConns`, `MaxIdleConnsPerHost`, and `MaxConnsPerHost = numWorkers * 2`), configured with `256 KB` read buffers, `64 KB` write buffers, and `DisableCompression: true`.
+- **Head-of-Line Hedged Request Recovery (Slow-Chunk Timeout)**: Continuously monitors the head chunk that the sequential archive reader (such as RAR5 or TAR) is waiting on. If the head chunk stalls (no progress for 5 seconds, or throughput drops below 20% of the active rolling average / below 200 KB/s while peer streams are healthy), DirectCrate spawns a hedged backup HTTP Range request for the identical byte range on a fresh connection. Whichever response finishes first supplies the chunk while immediately canceling the slower request's context and closing its body, with built-in safeguards (max 1 active hedge per chunk and automatic backoff on HTTP `429` or `503`).
+- **Platform-Aware Sliding-Window Prefetch Buffer**: Operates as a continuous sliding window where workers immediately fetch chunk `N + 1` the instant a slot is freed by the reader. On Desktop (`linux`, `windows`, `darwin`), prefetches 24–32+ chunks ahead by default and scales dynamically with the user's configured `I/O Stream Buffer Size` (`bufferSize / chunkSize`, up to `512 MB` RAM). On Android, enforces a strict low prefetch cap (4–6 chunks default, max `64 MB`) to prevent mobile OOM kills. Chunk byte slices are recycled via `sync.Pool` to eliminate GC spikes.
+- **Adaptive Chunk Sizing (2 MB → 4 MB – 8 MB Sweet Spot)**: Starts sequential range streaming at `2 MB` chunks for fast time-to-first-byte (TTFB) and automatically ramps up to `4 MB – 8 MB` chunks on Desktop (`2 MB – 4 MB` on Android) once sustained throughput exceeds `25 MB/s`, stepping down if stalls or hedges occur.
+- **Double-Buffered Async Disk Writer & Safe Pre-Allocation**: Decouples CPU decompression from storage I/O using a dedicated writer goroutine paired with a pooled `bufio.Writer` (`4 MB` buffer on Desktop, `512 KB` on Android) so decompression and SSD writes execute concurrently. Pre-allocates contiguous disk space via Linux `fallocate` (with safe cross-platform fallbacks on Windows, Android, and non-ext4/xfs mounts) whenever an entry's uncompressed size is known ahead of time, guaranteeing deterministic flushing and error propagation before advancing to the next entry or upon Abort.
 - **Automatic Range Auto-Reconnect**: Resumes dropped TCP sockets transparently with exponential backoff (up to 10 retries) via `Range: bytes=<offset>-`.
 - **403/410 Expiring CDN URL Hot-Swap**: If a temporary CDN download ticket expires mid-stream with HTTP `403 Forbidden` or `410 Gone`, DirectCrate pauses without discarding extracted files, allowing you to paste a refreshed direct link to resume from the exact byte offset.
 - **Selective File Inspection & Extraction**: For ZIP and 7Z archives, clicking **Inspect** queries the remote Central Directory or 7Z metadata header via Range requests without downloading archive payloads. You can inspect the complete file hierarchy and uncheck unwanted files (such as bonus soundtracks, making-of videos, or redundant language packs) so DirectCrate downloads only the selected ranges.
@@ -170,8 +183,8 @@ Temporary speed dips are completely normal and part of how computer file storage
 
 ### 11. Preferences & Tuning Guide
 **What does each option in Settings -> Preferences do and when should I change them?**
-- **Parallel HTTP Connections (1, 2, 4, 8):** Controls concurrent prefetch range workers (default 4). Select **8** on gigabit fiber connections to maximize download speed. Select **1 or 2** if host servers enforce strict rate limits (`403 Forbidden` or `429 Too Many Requests`).
-- **I/O Stream Buffer Size (1 MB to 16 MB):** Memory buffer recycled via `sync.Pool` during extraction (default 4 MB). Use **1 MB or 2 MB** on low-RAM phones (2–4 GB RAM) to minimize memory pressure. Keep **4 MB** for balanced mobile/desktop use. Use **8 MB or 16 MB** on high-speed NVMe SSDs and Wi-Fi 6E/Ethernet to reduce drive write IOPS.
+- **Parallel HTTP Connections (Desktop: 1, 2, 4, 6, 8, 12, 16 • Android: capped at 8):** Controls concurrent prefetch range workers over dedicated HTTP/1.1 TCP sockets (default 4). Select **8, 12, or 16** on high-speed multi-gigabit fiber connections to maximize download speed. Select **1 or 2** if host servers enforce strict rate limits (`403 Forbidden` or `429 Too Many Requests`).
+- **I/O Stream Buffer Size (Desktop: 1 MB to 512 MB • Android: capped at 64 MB):** Memory ceiling wired directly into the sliding-window prefetch buffer (`bufferSize / chunkSize`) and recycled via `sync.Pool` during extraction (default 4 MB). Use **1 MB or 2 MB** on low-RAM phones (2–4 GB RAM) to minimize memory pressure. Keep **4 MB** for balanced mobile/desktop use. Raise to **64 MB, 128 MB, 256 MB, or 512 MB** on desktop PCs with high-speed NVMe SSDs and Wi-Fi 6E/Ethernet for deep sliding-window network prefetching.
 - **Folder Conflict Policy:** Choose whether to *Ask Every Time*, *Merge with Existing*, *Clean & Overwrite*, or *Auto-Rename* (`_2`, `_3`) when target folders already exist.
 - **Flatten Single Root Folder:** Automatically hoists redundant single parent wrappers (e.g. `Game/Game/game.exe` → `Game/game.exe`).
 - **Auto Checksum Verification:** Automatically discovers and verifies `.sha256`, `sha256sums.txt`, or `.md5` in the extracted root after extraction completes.
@@ -269,10 +282,10 @@ DirectCrate is engineered for extreme hardware efficiency with full transparency
 
 | Hardware Subsystem | How DirectCrate Utilizes It | Device Safeguards & Limits |
 | :--- | :--- | :--- |
-| **Network (Bandwidth)** | Direct HTTP/HTTPS streaming with parallel HTTP Range prefetching (1–8 concurrent connections, default 4). Supports token-bucket rate limiting (`5–50 MB/s` or `Unlimited`), persistent HTTP/2 and HTTP/1.1 connection pooling, automatic TCP socket reconnection with exponential backoff, and mid-stream URL hot-swapping for expiring CDN tokens. | `globalRateLimiter` enforces strict bandwidth caps without packet spikes; `DisableCompression: true` prevents upstream proxy tampering; range probing falls back gracefully from `HEAD` to `GET Range: bytes=0-0` on `405`/`403`. |
-| **RAM (Process Memory)** | RAM: ~30–64 MB on Desktop/CLI (~95–130 MB on Android including embedded WebView UI), tracked in live telemetry with zero-leak `sync.Pool` buffer recycling. | Uses `sync.Pool` to recycle 1 MB–16 MB I/O buffers and 256 KB buffered writers without triggering Go runtime GC pauses, eliminating Out-Of-Memory (OOM) risks on RAM-constrained 4 GB–16 GB devices. |
-| **CPU (Decompression)** | Decompresses streaming bytes (RAR5, ZIP/deflate, 7Z/LZMA2, TAR Zstd/Gzip) on the fly using native Go decoders. Workers execute at normal user-space priority. | Lightweight CPU footprint preserves battery longevity on Steam Deck and Android mobile devices, preventing thermal throttling and keeping fan noise minimal. |
-| **Storage (Disk I/O)** | **Zero intermediate archive files.** Decompressed data streams directly to final target files on disk (`io.CopyBuffer` via 256 KB `bufio.Writer`). | Pre-flight write probe validates directory writability; pre-flight capacity check verifies space against remote `Content-Length` (`+1 GB` safety buffer); mid-stream `needs_disk` pauses extraction on `ENOSPC` and auto-resumes once `512 MB` is cleared. |
+| **Network (Bandwidth)** | Direct HTTP/HTTPS streaming over dedicated HTTP/1.1 TCP sockets (`ForceAttemptHTTP2: false`) with parallel HTTP Range prefetching (1–16 concurrent connections on Desktop, 1–8 on Android, default 4), adaptive chunk sizing (2 MB → 4 MB – 8 MB above 25 MB/s), and head-of-line hedged request recovery for stalled chunks. Supports token-bucket rate limiting (`5–50 MB/s` or `Unlimited`), scaled connection pooling (`numWorkers * 2`), automatic TCP socket reconnection with exponential backoff, and mid-stream URL hot-swapping for expiring CDN tokens. | `globalRateLimiter` enforces strict bandwidth caps without packet spikes; `DisableCompression: true` prevents upstream proxy tampering; hedging allows at most 1 active backup request per stalled head chunk and backs off automatically on HTTP `429`/`503`; range probing falls back gracefully from `HEAD` to `GET Range: bytes=0-0` on `405`/`403`. |
+| **RAM (Process Memory)** | Continuous sliding-window prefetch buffer (24–32+ chunks default on Desktop, scaling up to 512 MB RAM with `I/O Stream Buffer Size`; capped at 4–6 chunks default / 64 MB max on Android), tracked in live telemetry with zero-leak `sync.Pool` buffer recycling. | Uses `sync.Pool` to recycle 2 MB–8 MB range chunks, copy buffers, and double-buffered async writers (`4 MB` on Desktop, `512 KB` on Android) without triggering Go runtime GC pauses, eliminating Out-Of-Memory (OOM) risks on RAM-constrained devices. |
+| **CPU (Decompression)** | Decompresses streaming bytes (RAR5, ZIP/deflate, 7Z/LZMA2, TAR Zstd/Gzip) on the fly using native Go decoders concurrently with asynchronous disk I/O. Workers execute at normal user-space priority. | Lightweight CPU footprint preserves battery longevity on Steam Deck and Android mobile devices, preventing thermal throttling and keeping fan noise minimal. |
+| **Storage (Disk I/O)** | **Zero intermediate archive files.** Decompressed data streams through a double-buffered asynchronous writer (`4 MB` Desktop / `512 KB` Android `bufio.Writer`) with Linux `fallocate` block pre-allocation (and safe cross-platform fallbacks). | Pre-flight write probe validates directory writability; pre-flight capacity check verifies space against remote `Content-Length` (`+1 GB` safety buffer); mid-stream `needs_disk` pauses extraction on `ENOSPC` and auto-resumes once `512 MB` is cleared; deterministic flush and close before each entry and on Abort. |
 
 ### Live Hardware Telemetry
 

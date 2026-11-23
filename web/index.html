@@ -1933,7 +1933,7 @@
 		<div id="updateBanner" style="display: none; align-items: center; justify-content: space-between; gap: 8px; background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 8px; padding: 8px 12px; margin-bottom: 14px; font-size: 0.8rem; color: var(--text);">
 			<div style="display: flex; align-items: center; gap: 8px;">
 				<span style="color: var(--accent); font-weight: 600;">Update Available:</span>
-				<span id="updateVersionTag">v1.0.1</span>
+				<span id="updateVersionTag">v1.1.0</span>
 			</div>
 			<div style="display: flex; gap: 8px; align-items: center;">
 				<button type="button" class="btn-sec" style="padding: 3px 10px; font-size: 0.76rem; border-color: var(--accent); color: var(--accent);" onclick="openReleasePage()">Update</button>
@@ -2362,7 +2362,10 @@
 							<option value="1">1 Connection (Sequential / Low overhead)</option>
 							<option value="2">2 Connections</option>
 							<option value="4" selected>4 Connections (Balanced Acceleration)</option>
-							<option value="8">8 Connections (Maximum Bandwidth)</option>
+							<option value="6">6 Connections</option>
+							<option value="8">8 Connections (High Bandwidth / Mobile Max)</option>
+							<option value="12" data-desktop-only="true">12 Connections (Multi-Gigabit Desktop)</option>
+							<option value="16" data-desktop-only="true">16 Connections (Maximum Desktop Streams)</option>
 						</select>
 					</div>
 
@@ -2373,9 +2376,12 @@
 							<option value="2">2 MB (Light / Mobile)</option>
 							<option value="4" selected>4 MB (Balanced Default)</option>
 							<option value="8">8 MB (High-Speed NVMe & WiFi 6E)</option>
-							<option value="16">16 MB (Maximum Gigabit / Desktop Throughput)</option>
-							<option value="32">32 MB (Extreme 2.5G/10G LAN / High-End NVMe)</option>
-							<option value="64">64 MB (Maximum Buffer / Ultra-High Throughput)</option>
+							<option value="16">16 MB (Gigabit Desktop Throughput)</option>
+							<option value="32">32 MB (2.5G/10G LAN / High-End NVMe)</option>
+							<option value="64">64 MB (Deep Prefetch / Mobile Max)</option>
+							<option value="128" data-desktop-only="true">128 MB (Desktop Deep Sliding Window)</option>
+							<option value="256" data-desktop-only="true">256 MB (Desktop High-Capacity Prefetch)</option>
+							<option value="512" data-desktop-only="true">512 MB (Desktop Maximum RAM Prefetch)</option>
 						</select>
 						<div id="prefStreamLockNotice" style="display: none; font-size: 0.78rem; color: var(--text-muted); margin-top: 6px;">🔒 Applies to next download (locked during active stream)</div>
 					</div>
@@ -2517,8 +2523,8 @@
 							</button>
 							<div class="faq-answer">DirectCrate's Preferences allow you to fine-tune network, memory, disk, and lifecycle behavior:
 								<ul style="margin: 6px 0 0 0; padding-left: 18px; line-height: 1.55;">
-									<li><b>Parallel HTTP Connections (1, 2, 4, 8):</b> Controls how many concurrent worker streams fetch chunk ranges simultaneously (default 4). Select <b>8</b> on fast multi-gigabit fiber connections to maximize throughput. Drop to <b>1 or 2</b> if a host server enforces aggressive rate limiting (returning HTTP <code>403 Forbidden</code> or <code>429 Too Many Requests</code>), or on unstable cellular networks.</li>
-									<li><b>I/O Stream Buffer Size (1 MB to 64 MB):</b> Configures the memory buffer size recycled via <code>sync.Pool</code> during decompression (default 4 MB). Use <b>1 MB or 2 MB</b> on low-RAM smartphones (2–4 GB RAM) to minimize memory pressure. Keep <b>4 MB</b> for balanced mobile/desktop use. Use <b>8 MB, 16 MB, 32 MB, or 64 MB</b> on high-speed NVMe SSDs and multi-gigabit LAN/Ethernet to minimize I/O syscalls and maximize sustained disk throughput.</li>
+									<li><b>Parallel HTTP Connections (1 to 16 on Desktop, capped at 8 on Android):</b> Controls how many concurrent worker streams fetch chunk ranges simultaneously over dedicated HTTP/1.1 TCP sockets (default 4). Select <b>8, 12, or 16</b> on fast multi-gigabit fiber connections to maximize throughput. Drop to <b>1 or 2</b> if a host server enforces aggressive rate limiting (returning HTTP <code>403 Forbidden</code> or <code>429 Too Many Requests</code>), or on unstable cellular networks.</li>
+									<li><b>I/O Stream Buffer Size (1 MB to 512 MB on Desktop, capped at 64 MB on Android):</b> Configures the memory ceiling wired into the continuous sliding-window prefetch buffer and <code>sync.Pool</code> recycling (default 4 MB). Use <b>1 MB or 2 MB</b> on low-RAM smartphones (2–4 GB RAM) to minimize memory pressure. Keep <b>4 MB</b> for balanced mobile/desktop use. Raise to <b>64 MB, 128 MB, 256 MB, or 512 MB</b> on high-speed NVMe SSDs and multi-gigabit LAN/Ethernet for deep sliding-window network prefetching.</li>
 									<li><b>Folder Conflict Policy:</b> Determines behavior when the target folder already exists: <i>Ask Every Time</i> prompts you; <i>Merge with Existing</i> overwrites identical files while keeping unique ones; <i>Clean & Overwrite</i> wipes the folder first; <i>Auto-Rename</i> appends an incremental suffix (<code>_2</code>, <code>_3</code>).</li>
 									<li><b>Flatten Single Root Folder:</b> Automatically eliminates redundant nested parent folders (e.g. <code>Game/Game/game.exe</code> is automatically hoisted into <code>Game/game.exe</code>).</li>
 									<li><b>Auto Checksum Verification:</b> Automatically detects and verifies checksum files (<code>.sha256</code>, <code>sha256sums.txt</code>, <code>.md5</code>) in the root of the extracted folder upon completion.</li>
@@ -2948,7 +2954,7 @@
 				</div>
 
 				<div class="tab-pane" id="tab-about">
-					<div style="font-weight: 600; font-size: 0.95rem; color: var(--text); margin-bottom: 6px;">DirectCrate v1.0.1</div>
+					<div style="font-weight: 600; font-size: 0.95rem; color: var(--text); margin-bottom: 6px;">DirectCrate v1.1.0</div>
 					<p style="margin: 0 0 12px 0; color: var(--text-muted); line-height: 1.5; font-size: 0.82rem;">
 						Direct-to-disk remote archive streamer engineered for storage-constrained devices including Steam Deck, ROG Ally, Bazzite/SteamOS handhelds, Linux & Windows desktops, and Android 15/16 mobile environments.
 					</p>
@@ -3020,7 +3026,7 @@
 					<!-- Update Check Section -->
 					<div style="margin-bottom: 12px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px;">
 						<div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; margin-bottom: 8px;">
-							<span>Installed Version: <b style="color: var(--text);">v1.0.1</b></span>
+							<span>Installed Version: <b style="color: var(--text);">v1.1.0</b></span>
 							<span id="manualUpdateStatus" style="font-size: 0.76rem; color: var(--text-dim);">Up to date</span>
 						</div>
 						<div style="display: flex; gap: 8px;">
@@ -3352,10 +3358,10 @@
 					showToast('Update check failed: ' + data.error, 'error');
 				} else {
 					if (statusEl) {
-						statusEl.textContent = 'You are on the latest version (v1.0.1)';
+						statusEl.textContent = 'You are on the latest version (v1.1.0)';
 						statusEl.style.color = 'var(--text-muted)';
 					}
-					showToast('DirectCrate is up to date (v1.0.1)', 'info');
+					showToast('DirectCrate is up to date (v1.1.0)', 'info');
 				}
 			} catch (e) {
 				if (statusEl) {
@@ -3543,7 +3549,7 @@
 		let activeLogPath = "";
 		let systemOS = "";
 		let systemArch = "";
-		let directcrateVersion = "v1.0.1";
+		let directcrateVersion = "v1.1.0";
 		let isExtractionActive = false;
 		let lastErrorMessage = "";
 		let lastNotificationUpdate = 0;
@@ -3984,6 +3990,33 @@
 				const el = document.getElementById(id);
 				if (el) el.style.display = isAndroid ? 'none' : '';
 			});
+
+			const parallelSel = document.getElementById('prefParallelConns');
+			if (parallelSel) {
+				Array.from(parallelSel.options).forEach(opt => {
+					if (opt.dataset.desktopOnly === 'true') {
+						opt.hidden = Boolean(isAndroid);
+						opt.disabled = Boolean(isAndroid);
+					}
+				});
+				if (isAndroid && (parseInt(parallelSel.value, 10) || 4) > 8) {
+					parallelSel.value = '8';
+				}
+			}
+
+			const bufferSel = document.getElementById('prefBufferSize');
+			if (bufferSel) {
+				Array.from(bufferSel.options).forEach(opt => {
+					if (opt.dataset.desktopOnly === 'true') {
+						opt.hidden = Boolean(isAndroid);
+						opt.disabled = Boolean(isAndroid);
+					}
+				});
+				if (isAndroid && (parseInt(bufferSel.value, 10) || 4) > 64) {
+					bufferSel.value = '64';
+				}
+			}
+
 			if (isAndroid) {
 				const steamChk = document.getElementById('prefAddSteam');
 				if (steamChk) steamChk.checked = false;
@@ -3992,6 +4025,10 @@
 				const exeSec = document.getElementById('exeSection');
 				if (exeSec) exeSec.style.display = 'none';
 			}
+
+			document.querySelectorAll('.custom-select-wrapper').forEach(w => {
+				if (w._rebuild) w._rebuild();
+			});
 		}
 
 		// Custom theme-matched dropdown component
@@ -4041,6 +4078,7 @@
 				menu.innerHTML = '';
 				let selectedText = '';
 				Array.from(select.options).forEach((opt) => {
+					if (opt.hidden) return;
 					const item = document.createElement('div');
 					item.className = 'custom-select-option';
 					item.setAttribute('role', 'option');
@@ -5920,7 +5958,7 @@ All streaming activity, HTTP status codes, and engine errors are logged locally 
 			const platformStr = [systemOS, systemArch].filter(Boolean).join('/') || navigator.platform || 'Unknown';
 			const report = [
 				'### DirectCrate Diagnostic Report',
-				'- **Version:** ' + (directcrateVersion || 'v1.0.1'),
+				'- **Version:** ' + (directcrateVersion || 'v1.1.0'),
 				'- **OS / Arch:** ' + platformStr,
 				'- **Browser:** ' + navigator.userAgent,
 				'- **Timestamp:** ' + new Date().toISOString(),
